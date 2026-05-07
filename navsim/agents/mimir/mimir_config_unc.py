@@ -22,8 +22,8 @@ class MimirConfig:
 
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
-    bkb_path: str = "/home/users/bencheng.liao/.cache/huggingface/hub/checkpoints/resnet34.a1_in1k/pytorch_model.bin"
-    plan_anchor_path: str = "/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/ckpts/kmeans_navsim_traj_20.npy"
+    bkb_path: str = "/home/navsim/ckpt/resnet34.a1_in1k/pytorch_model.bin"
+    plan_anchor_path: str = "/home/navsim/dataset/kmeans_navsim_traj_20.npy"
 
     # lidar_latent: 
     latent: bool = False

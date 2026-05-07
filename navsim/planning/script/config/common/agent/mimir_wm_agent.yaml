@@ -12,6 +12,9 @@ config:
     interval_length: 0.5
 
   latent: False
+  use_wm: True
+  wm_num_future_frames: 3
+  wm_sensor_indices: [3]
 
   training: False
   use_proj_image: False
@@ -25,5 +28,5 @@ config:
   goal_coord_path: null
   navi_unc_outputdir: null
 checkpoint_path: null
-lr: 1e-4
+lr: 6e-4
 traj_save_path: null

@@ -133,8 +133,7 @@ class MimirModel(nn.Module):
             self._status_encoding=nn.Linear(4+1+1,config.tf_d_model)
         else:
             self._status_encoding = nn.Linear(4 + 2 + 2, config.tf_d_model)
-        # 只用command
-        # self._status_encoding = nn.Linear(4, config.tf_d_model)
+
         self._bev_semantic_head = nn.Sequential(
             nn.Conv2d(
                 config.bev_features_channels,
@@ -192,13 +191,8 @@ class MimirModel(nn.Module):
         """Torch module forward pass."""
 
         camera_feature: torch.Tensor = features["camera_feature"]
-        
-        if self._config.latent:
-            lidar_feature = None
-        else:
-            lidar_feature: torch.Tensor = features["lidar_feature"]
+        lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
-        
         if self._config.status_norm and self._config.training==False:
             vle = torch.norm(status_feature[:,4:6],dim=-1,keepdim=True)
             acc = torch.norm(status_feature[:,6:8],dim=-1,keepdim=True)
@@ -259,7 +253,6 @@ class MimirModel(nn.Module):
         agents = self._agent_head(agents_query)
         output.update(agents)
         return output
-        # return output
 
 class AgentHead(nn.Module):
     """Bounding box prediction head."""
@@ -392,7 +385,6 @@ class CustomTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(0.1)
         self.dropout1 = nn.Dropout(0.1)
-        
         self.cross_bev_attention = GridSampleCrossBEVAttention(
             config.tf_d_model,
             config.tf_num_head,

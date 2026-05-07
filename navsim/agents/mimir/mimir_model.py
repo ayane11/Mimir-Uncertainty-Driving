@@ -145,8 +145,7 @@ class MimirModel(nn.Module):
             self._status_encoding=nn.Linear(4+1+1,config.tf_d_model)
         else:
             self._status_encoding = nn.Linear(4 + 2 + 2, config.tf_d_model)
-        # 只用command
-        # self._status_encoding = nn.Linear(4, config.tf_d_model)
+
         self._bev_semantic_head = nn.Sequential(
             nn.Conv2d(
                 config.bev_features_channels,
@@ -224,8 +223,6 @@ class MimirModel(nn.Module):
             tag_acc = torch.where(dot_product > 0,1.0,-1.0)
             status_feature= torch.cat([status_feature[:,:4], tag_vle*vle,tag_acc*acc], dim=-1)
         
-        # 只用command
-        # status_feature=status_feature[:,:4]
         
         batch_size = status_feature.shape[0]
 
@@ -443,7 +440,6 @@ class CustomTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(0.1)
         self.dropout1 = nn.Dropout(0.1)
-        
         self.cross_bev_attention = GridSampleCrossBEVAttention(
             config.tf_d_model,
             config.tf_num_head,
@@ -549,7 +545,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         poses_reg, poses_cls = self.task_decoder(traj_feature) #bs,20,8,3; bs,20
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
-        
+
         return poses_reg, poses_cls
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
@@ -614,8 +610,8 @@ class TrajectoryHead(nn.Module):
             beta_schedule="scaled_linear",
             prediction_type="sample",
         )
-        # print(plan_anchor_path)
-        # import pdb;pdb.set_trace()
+
+
         plan_anchor = np.load(plan_anchor_path)
 
         self.plan_anchor = nn.Parameter(
@@ -646,7 +642,6 @@ class TrajectoryHead(nn.Module):
         self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
 
         self.loss_computer = LossComputer(config)
-        self.training=config.training
         self.use_gt_goal_train=config.use_gt_goal_train
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
@@ -707,15 +702,6 @@ class TrajectoryHead(nn.Module):
         time_embed = self.time_mlp(timesteps)
         time_embed = time_embed.view(bs,1,-1)
 
-        # if self.use_gt_goal_train:
-        #     navi_points = targets['trajectory'][:,-1,:2]
-        # else:
-        #     navi_points = targets['navi_points']
-        #     # navi_points= torch.zeros_like(targets['trajectory'][:,-1,:2])
-        # alpha=0.3
-        # gt_points=targets['trajectory'][:,-1,:2]
-        # distances=torch.norm(gt_points-navi_points,dim=1).to(traj_feature)
-        # points_score=torch.exp(-alpha*distances)
         navi_points=goalpoint
         # 4. begin the stacked decoder
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score)
@@ -801,4 +787,3 @@ class TrajectoryHead(nn.Module):
         return {"trajectory": best_reg,
                 'anchor_trajectories': poses_reg
                 }
-    

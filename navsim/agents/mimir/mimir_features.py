@@ -162,12 +162,48 @@ class MimirTargetBuilder(AbstractTargetBuilder):
         agent_states, agent_labels = self._compute_agent_targets(annotations)
         bev_semantic_map = self._compute_bev_semantic_map(annotations, scene.map_api, ego_pose)
 
-        return {
+        targets = {
             "trajectory": trajectory,
             "agent_states": agent_states,
             "agent_labels": agent_labels,
             "bev_semantic_map": bev_semantic_map,
         }
+
+        if self._config.use_wm:
+            self._add_wm_future_bev_semantic_targets(scene, targets)
+
+        return targets
+
+    @property
+    def _num_wm_future_frames(self) -> int:
+        return int(getattr(self._config, "wm_num_future_frames", 3))
+
+    def _add_wm_future_bev_semantic_targets(
+        self,
+        scene: Scene,
+        targets: Dict[str, torch.Tensor],
+    ) -> None:
+        current_frame_idx = scene.scene_metadata.num_history_frames - 1
+        last_required_frame_idx = current_frame_idx + self._num_wm_future_frames
+        if last_required_frame_idx >= len(scene.frames):
+            raise RuntimeError(
+                f"use_wm=True requires {self._num_wm_future_frames} future frames after the current frame, "
+                f"but scene only has {len(scene.frames) - current_frame_idx - 1} future frames."
+            )
+
+        future_bev_semantic_maps = []
+        for future_offset in range(1, self._num_wm_future_frames + 1):
+            future_frame_idx = current_frame_idx + future_offset
+            future_ego_pose = StateSE2(*scene.frames[future_frame_idx].ego_status.ego_pose)
+            future_bev_semantic_maps.append(
+                self._compute_bev_semantic_map(
+                    scene.frames[future_frame_idx].annotations,
+                    scene.map_api,
+                    future_ego_pose,
+                )
+            )
+
+        targets["wm_future_bev_semantic_map"] = torch.stack(future_bev_semantic_maps)
 
     def _compute_agent_targets(self, annotations: Annotations) -> Tuple[torch.Tensor, torch.Tensor]:
         """

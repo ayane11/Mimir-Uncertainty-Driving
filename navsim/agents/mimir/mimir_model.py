@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
@@ -203,17 +203,44 @@ class MimirModel(nn.Module):
         self.goalpoints=None
         if self._config.navi_path:
             self.goalpoints=np.load(self._config.navi_path,allow_pickle=True).item()
-    
+
+        if self._config.use_wm:
+            self._wm_num_future_frames = int(getattr(config, "wm_num_future_frames", 3))
+            self._wm_window_num_poses = config.trajectory_sampling.num_poses - self._wm_num_future_frames + 1
+            if self._wm_window_num_poses <= 0:
+                raise ValueError(
+                    "WM sliding-window trajectory length must be positive. "
+                    f"Received num_poses={config.trajectory_sampling.num_poses} and "
+                    f"wm_num_future_frames={self._wm_num_future_frames}."
+                )
+            wm_decoder_layer = nn.TransformerDecoderLayer(
+                d_model=config.tf_d_model,
+                nhead=config.wm_num_head,
+                dim_feedforward=config.wm_d_ffn,
+                dropout=config.wm_dropout,
+                batch_first=True,
+            )
+            self._wm_decoder = nn.TransformerDecoder(wm_decoder_layer, config.wm_num_layers)
+            wm_action_dim = self._wm_window_num_poses * 2
+            self._wm_action_aware_encoder = nn.Sequential(
+                nn.Linear(config.tf_d_model + wm_action_dim, config.tf_d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(config.tf_d_model, config.tf_d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(config.tf_d_model, config.tf_d_model),
+            )
+            self._wm_bev_feature_head = nn.Sequential(
+                nn.Conv2d(config.tf_d_model, config.bev_features_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(config.bev_features_channels, config.bev_features_channels, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+            )
+
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None,goalpoint=None,token=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
 
         camera_feature: torch.Tensor = features["camera_feature"]
-        
-        if self._config.latent:
-            lidar_feature = None
-        else:
-            lidar_feature: torch.Tensor = features["lidar_feature"]
-        # lidar_feature: torch.Tensor = features["lidar_feature"]
+        lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
         if self._config.status_norm and self._config.training==False:
             vle = torch.norm(status_feature[:,4:6],dim=-1,keepdim=True)
@@ -251,7 +278,6 @@ class MimirModel(nn.Module):
                 points_score=load_navis_from_np(self.weight_score,features['token']).to(bev_feature)
             else:
                 points_score=load_navis_from_np(self.weight_score,token).to(bev_feature)
-            # points_score=0.0
         else:
             points_score=None
         
@@ -294,8 +320,105 @@ class MimirModel(nn.Module):
 
         agents = self._agent_head(agents_query)
         output.update(agents)
+
+        if self._config.use_wm and targets is not None:
+            if "wm_future_bev_semantic_map" not in targets:
+                target_keys = ", ".join(sorted(targets.keys()))
+                raise RuntimeError(
+                    "use_wm=True requires future BEV semantic map targets, but none were found. "
+                    "Rebuild the cache with the WM future BEV target builder, "
+                    f"and check target keys. Received target keys: {target_keys}"
+                )
+
+            wm_full_trajectory = output["trajectory"]
+            wm_latent = keyval
+            wm_future_bev_semantic_maps = []
+
+            for future_offset in range(1, self._wm_num_future_frames + 1):
+                window_start = future_offset - 1
+                wm_trajectory = self._get_wm_trajectory_window(
+                    trajectory=wm_full_trajectory,
+                    window_start=window_start,
+                )
+                wm_latent = self._predict_next_latent(
+                    prev_latent=wm_latent,
+                    prev_trajectory=wm_trajectory,
+                )
+                wm_future_bev_semantic_maps.append(self._decode_wm_bev_semantic_map(wm_latent))
+
+            output["wm_future_bev_semantic_map"] = torch.stack(wm_future_bev_semantic_maps, dim=1)
+
         return output
-        # return output
+
+    def _decode_wm_bev_semantic_map(self, wm_latent: torch.Tensor) -> torch.Tensor:
+        """Decode predicted WM latent tokens into a future ego-frame BEV semantic map."""
+
+        batch_size, _, channels = wm_latent.shape
+        bev_tokens = wm_latent[:, :-1]
+        bev_side = int(np.sqrt(bev_tokens.shape[1]))
+        if bev_side * bev_side != bev_tokens.shape[1]:
+            raise ValueError(f"Expected square BEV tokens, got {bev_tokens.shape[1]} tokens.")
+
+        bev_feature = bev_tokens.permute(0, 2, 1).contiguous().view(batch_size, channels, bev_side, bev_side)
+        bev_feature = F.interpolate(
+            bev_feature,
+            size=(
+                self._config.lidar_resolution_height // self._config.bev_down_sample_factor,
+                self._config.lidar_resolution_width // self._config.bev_down_sample_factor,
+            ),
+            mode="bilinear",
+            align_corners=False,
+        )
+        bev_feature = self._wm_bev_feature_head(bev_feature)
+        return self._bev_semantic_head(bev_feature)
+
+    def _predict_next_latent(
+        self,
+        prev_latent: torch.Tensor,
+        prev_trajectory: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict next ego-frame latent tokens from the previous latent and ego action."""
+        batch_size, num_tokens, _ = prev_latent.shape
+        prev_waypoints = prev_trajectory[..., :2].reshape(batch_size, 1, -1)
+        prev_waypoints = prev_waypoints.repeat(1, num_tokens, 1)
+        action_aware_latent = self._wm_action_aware_encoder(
+            torch.cat([prev_latent, prev_waypoints], dim=-1)
+        )
+        return self._wm_decoder(action_aware_latent, action_aware_latent)
+
+    def _get_wm_trajectory_window(
+        self,
+        trajectory: torch.Tensor,
+        window_start: int,
+    ) -> torch.Tensor:
+        """Take a path slice and express it in the previous predicted ego frame."""
+        window_end = window_start + self._wm_window_num_poses
+        if window_end > trajectory.shape[1]:
+            raise ValueError(
+                f"WM trajectory window [{window_start}, {window_end}) exceeds predicted path length "
+                f"{trajectory.shape[1]}."
+            )
+
+        window = trajectory[:, window_start:window_end]
+        if window_start == 0:
+            return window
+
+        origin = trajectory[:, window_start - 1:window_start]
+        dx = window[..., StateSE2Index.X] - origin[..., StateSE2Index.X]
+        dy = window[..., StateSE2Index.Y] - origin[..., StateSE2Index.Y]
+        dtheta = window[..., StateSE2Index.HEADING] - origin[..., StateSE2Index.HEADING]
+
+        cos_theta = torch.cos(origin[..., StateSE2Index.HEADING])
+        sin_theta = torch.sin(origin[..., StateSE2Index.HEADING])
+
+        rebased_x = cos_theta * dx + sin_theta * dy
+        rebased_y = -sin_theta * dx + cos_theta * dy
+        rebased_heading = self._normalize_angle(dtheta)
+        return torch.stack([rebased_x, rebased_y, rebased_heading], dim=-1)
+
+    @staticmethod
+    def _normalize_angle(angle: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 class AgentHead(nn.Module):
     """Bounding box prediction head."""
@@ -485,20 +608,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(config.tf_d_model)
         self.norm2 = nn.LayerNorm(config.tf_d_model)
         self.norm3 = nn.LayerNorm(config.tf_d_model)
-
-        self.use_proj_image=config.use_proj_image
-        if config.use_proj_image:
-            self.cross_imgnavi_attention = nn.MultiheadAttention(
-                config.tf_d_model,
-                config.tf_num_head,
-                dropout=config.tf_dropout,
-                batch_first=True,
-            )
-            self.dropout2 = nn.Dropout(0.1)
-            self.norm4 = nn.LayerNorm(config.tf_d_model)
-            self.time_modulation=ModulationLayer(config.tf_d_model,256)
-        else:
-            self.time_modulation = ModulationLayer(config.tf_d_model,256)
+        self.time_modulation = ModulationLayer(config.tf_d_model,256)
         self.task_decoder = DiffMotionPlanningRefinementModule(
             embed_dims=config.tf_d_model,
             ego_fut_ts=num_poses,
@@ -518,11 +628,6 @@ class CustomTransformerDecoderLayer(nn.Module):
                 navi_points=None,
                 points_score=1.0,
                 ):
-        if self.use_proj_image:
-            global_img=global_img.permute(0,2,1)
-            traj_feature = traj_feature+self.dropout2(self.cross_imgnavi_attention(traj_feature,global_img,global_img)[0])
-            traj_feature=self.norm4(traj_feature)
-            
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
         if navi_points is not None:
             traj_feature = self.cross_bev_attention_navi(traj_feature,navi_points,bev_feature,bev_spatial_shape,points_score)
@@ -768,7 +873,7 @@ class TrajectoryHead(nn.Module):
             # 4. begin the stacked decoder
             navi_points = goalpoint
             poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score)
-            poses_reg = poses_reg_list[-1] 
+            poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
             x_start = self.norm_odo(x_start)
@@ -777,10 +882,8 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
-        # poses_cls = poses_cls.view(bs, anchor*num_samples)  
-        mode_idx = poses_cls.argmax(dim=-1)  
+        mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
-
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
         poses_reg = poses_reg.view(bs, anchor, num_samples, self._num_poses, 3)
                 

@@ -128,15 +128,6 @@ class MimirAgent(AbstractAgent):
     
             navi= predictions["navi"].squeeze()
             unc= predictions["unc"].squeeze()
-            # # unc_path='/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/workspace/socket/navsim_exp/1_goal_point_unc/navhard_noise'
-            # # unc_path='/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/workspace/socket/navsim_exp/1_goal_point_unc/navhard_lidar'
-            # # unc_path='/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/workspace/socket/navsim_exp/1_goal_point_unc/navhard_plus_revise'
-            # unc_path=self._config.navi_unc_outputdir
-            # os.makedirs(unc_path,exist_ok=True)
-            # os.makedirs(os.path.join(unc_path,'navi'),exist_ok=True)
-            # os.makedirs(os.path.join(unc_path,'unc'),exist_ok=True)
-            # np.save(os.path.join(unc_path,'navi',f'{token}.npy'),navi.cpu().numpy())
-            # np.save(os.path.join(unc_path,'unc',f'{token}.npy'),unc.cpu().numpy())
 
             return navi.cpu().numpy(), unc.cpu().numpy()
 

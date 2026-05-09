@@ -13,7 +13,6 @@ from navsim.common.dataclasses import SceneFilter
 from navsim.common.dataloader import SceneLoader
 from navsim.planning.training.dataset import CacheOnlyDataset, Dataset
 from navsim.planning.training.agent_lightning_module import AgentLightningModule
-from pytorch_lightning.strategies import DDPStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +128,7 @@ def main(cfg: DictConfig) -> None:
     logger.info("Num validation samples: %d", len(val_data))
 
     logger.info("Building Trainer")
-    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks(),strategy=DDPStrategy(find_unused_parameters=True))
+    trainer = pl.Trainer(**cfg.trainer.params, callbacks=agent.get_training_callbacks())
 
     logger.info("Starting Training")
     trainer.fit(

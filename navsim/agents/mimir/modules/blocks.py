@@ -233,16 +233,17 @@ class GridSampleCrossBEVAttention_navi(nn.Module):
         # print(f"queries:{queries.shape}")
         # import pdb;pdb.set_trace()
         batch_size=bev_feature.shape[0]
+        num_queries = queries.shape[1]
         if not torch.is_tensor(navi_points):
             navi_points = torch.from_numpy(navi_points).float()
             navi_points=navi_points.to(torch.float32)
             navi_points=navi_points.unsqueeze(0)
             navi_points=navi_points.unsqueeze(1)
             navi_points=navi_points.unsqueeze(1)
-            navi_points=navi_points.expand(-1,1280,-1,-1)
+            navi_points=navi_points.expand(-1,num_queries,-1,-1)
         else:
             navi_points=navi_points.view(batch_size,1,1,2)
-            navi_points=navi_points.expand(-1,20,-1,-1)
+            navi_points=navi_points.expand(-1,num_queries,-1,-1)
         # 1 1280 1 2
         bs, num_queries, num_points, _ = navi_points.shape
         
@@ -325,12 +326,9 @@ class GridSampleCrossBEVAttention_naviscore(nn.Module):
         # print(f"queries:{queries.shape}")
         # import pdb;pdb.set_trace()
         batch_size=bev_feature.shape[0]
-        if not self.training:
-            navi_points=navi_points.view(batch_size,1,1,2)
-            navi_points=navi_points.expand(-1,1280,-1,-1)
-        else:
-            navi_points=navi_points.view(batch_size,1,1,2)
-            navi_points=navi_points.expand(-1,20,-1,-1)
+        num_queries = queries.shape[1]
+        navi_points=navi_points.view(batch_size,1,1,2)
+        navi_points=navi_points.expand(-1,num_queries,-1,-1)
         # 1 1280 1 2
         bs, num_queries, num_points, _ = navi_points.shape
         

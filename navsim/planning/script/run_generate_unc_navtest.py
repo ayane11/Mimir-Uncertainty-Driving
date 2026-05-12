@@ -129,7 +129,7 @@ def main(cfg: DictConfig) -> None:
 
     for result in score_rows:
         all_navi_dict.update({result['token']:result['navi']})
-        all_unc_dict.update({result['token']:result['navi']})
+        all_unc_dict.update({result['token']:result['unc']})
 
     logger.info(f"Finish: navi_dict total {len(all_navi_dict)} items, unc_dict total {len(all_unc_dict)} items")
 

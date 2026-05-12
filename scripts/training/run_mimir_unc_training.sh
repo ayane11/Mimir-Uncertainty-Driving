@@ -2,9 +2,14 @@ TRAIN_TEST_SPLIT=navtrain
 export CUDA_VISIBLE_DEVICES="3"
 
 export HYDRA_FULL_ERROR=1
-export NAVSIM_DEVKIT_ROOT='/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/workspace/Mimir'
-export NAVSIM_EXP_ROOT='/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/navsim_exp'
+export PYTHONPATH=/home/navsim/Mimir-Uncertainty-Driving/
+export NUPLAN_MAP_VERSION="nuplan-maps-v1.0"
+export NUPLAN_MAPS_ROOT="/home/navsim/dataset/maps"
+export NAVSIM_EXP_ROOT="/home/navsim/exp"
+export NAVSIM_DEVKIT_ROOT="/home/navsim/Mimir-Uncertainty-Driving"
+export OPENSCENE_DATA_ROOT="/home/navsim/dataset"
 export OPENBLAS_CORETYPE=Haswell
+
 CACHE_PATH='/lpai/volumes/ad-e2e-vol-ga/zhengyupeng/mimir_agent_feature_cache'
 COORD_PATH='/lpai/dataset/navsim-exp-mimir/25-12-23-1/navsim_exp/1_goal_point_coords/navtrain_default.npy'
 

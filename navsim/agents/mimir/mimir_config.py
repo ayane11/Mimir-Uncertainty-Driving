@@ -15,7 +15,6 @@ class MimirConfig:
     use_gt_goal_train: True
     status_norm: False
     use_unc_score: False
-    num_goal_points: int = 1
     trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
 
     goal_coord_path: str = ''

@@ -14,6 +14,7 @@ class MimirConfig:
     use_proj_image: False
     use_gt_goal_train: True
     status_norm: False
+    num_goal_points: int = 3
     trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
 
     navi_bank_path: str=''
@@ -90,6 +91,8 @@ class MimirConfig:
     trajectory_weight: float = 20.0
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
+    goal_selection_weight: float = 5.0
+    goal_selector_temperature: float = 1.0
     diff_loss_weight: float = 20.0
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0

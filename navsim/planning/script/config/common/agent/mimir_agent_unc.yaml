@@ -17,10 +17,11 @@ config:
   use_proj_image: False
   use_gt_goal_train: True
   status_norm: False
+  num_goal_points: 3
 
   navi_bank_path: ''
 
   goal_coord_path: null
   navi_unc_outputdir: null
 checkpoint_path: null
-lr: 6e-4
+lr: 1e-4

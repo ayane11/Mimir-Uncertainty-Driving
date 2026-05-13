@@ -11,7 +11,7 @@ from diffusers.schedulers import DDIMScheduler
 from navsim.agents.mimir.modules.conditional_unet1d import ConditionalUnet1D,SinusoidalPosEmb
 import torch.nn.functional as F
 from navsim.agents.mimir.modules.blocks import linear_relu_ln,bias_init_with_prob, gen_sineembed_for_position, GridSampleCrossBEVAttention,GridSampleCrossBEVAttention_navi,GridSampleCrossBEVAttention_naviscore
-from navsim.agents.mimir.modules.multimodal_loss import LossComputer, py_sigmoid_focal_loss
+from navsim.agents.mimir.modules.multimodal_loss import LossComputer
 from torch.nn import TransformerDecoder,TransformerDecoderLayer
 from typing import Any, List, Dict, Optional, Union,Tuple
 import numpy.typing as npt
@@ -102,36 +102,19 @@ def extract_feature_values_at_navi_batched(
 
     return feature_values  # shape: (B, C_feat, N)
 
-def _as_goal_point_array(value: npt.ArrayLike, num_goal_points: int) -> np.ndarray:
-    """Normalize stored goal/uncertainty entries to (K, D)."""
-
-    array = np.asarray(value, dtype=np.float32)
-    if array.ndim == 0:
-        array = array.reshape(1, 1)
-    while array.ndim > 2 and array.shape[0] == 1:
-        array = array.squeeze(0)
-    if array.ndim == 1:
-        if array.shape[0] == num_goal_points and num_goal_points > 1:
-            array = array[:, None]
-        else:
-            array = array[None, :]
-    elif array.ndim > 2:
-        array = array.reshape(-1, array.shape[-1])
-
-    if array.shape[0] == 0:
-        array = np.zeros((1, 2), dtype=np.float32)
-
-    if array.shape[0] < num_goal_points:
-        pad = np.repeat(array[-1:], num_goal_points - array.shape[0], axis=0)
-        array = np.concatenate([array, pad], axis=0)
-
-    return array[:num_goal_points]
-
-
-def load_navis_from_np(data_dict, token, num_goal_points: int = 1):
-    tokens = [token] if isinstance(token, str) else list(token)
-    data = [_as_goal_point_array(data_dict[t], num_goal_points) for t in tokens]
-    return torch.from_numpy(np.stack(data, axis=0))
+def load_navis_from_np(data_dict,token):
+    if isinstance(token,str):
+        data=[]
+        data.append(data_dict[token])
+        data=np.stack(data,axis=0)
+        data=torch.from_numpy(data).unsqueeze(1)
+    else:
+        data=[]
+        for t in token:
+            data.append(data_dict[t])
+        data=np.stack(data,axis=0)
+        data=torch.from_numpy(data).unsqueeze(1)
+    return data
 
 
 class MimirModel(nn.Module):
@@ -292,33 +275,17 @@ class MimirModel(nn.Module):
 
         if self.weight_score:
             if self._config.training:
-                points_score=load_navis_from_np(
-                    self.weight_score,
-                    features['token'],
-                    self._config.num_goal_points,
-                ).to(bev_feature)
+                points_score=load_navis_from_np(self.weight_score,features['token']).to(bev_feature)
             else:
-                points_score=load_navis_from_np(
-                    self.weight_score,
-                    token,
-                    self._config.num_goal_points,
-                ).to(bev_feature)
+                points_score=load_navis_from_np(self.weight_score,token).to(bev_feature)
         else:
             points_score=None
         
         if self.goalpoints:
             if self._config.training:
-                goalpoint=load_navis_from_np(
-                    self.goalpoints,
-                    features['token'],
-                    self._config.num_goal_points,
-                ).to(bev_feature)
+                goalpoint=load_navis_from_np(self.goalpoints,features['token']).to(bev_feature)
             else:
-                goalpoint=load_navis_from_np(
-                    self.goalpoints,
-                    token,
-                    self._config.num_goal_points,
-                ).to(bev_feature)
+                goalpoint=load_navis_from_np(self.goalpoints,token).to(bev_feature)
         else:
             goalpoint=None
         cross_bev_feature = bev_feature_upscale
@@ -596,7 +563,6 @@ class CustomTransformerDecoderLayer(nn.Module):
         super().__init__()
         self.dropout = nn.Dropout(0.1)
         self.dropout1 = nn.Dropout(0.1)
-        self.use_unc_score = config.use_unc_score
         self.cross_bev_attention = GridSampleCrossBEVAttention(
             config.tf_d_model,
             config.tf_num_head,
@@ -664,8 +630,7 @@ class CustomTransformerDecoderLayer(nn.Module):
                 ):
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
         if navi_points is not None:
-            navi_score = points_score if self.use_unc_score else 1.0
-            traj_feature = self.cross_bev_attention_navi(traj_feature,navi_points,bev_feature,bev_spatial_shape,navi_score)
+            traj_feature = self.cross_bev_attention_navi(traj_feature,navi_points,bev_feature,bev_spatial_shape,points_score)
         
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
         traj_feature = self.norm1(traj_feature)
@@ -744,8 +709,6 @@ class TrajectoryHead(nn.Module):
         self._d_ffn = d_ffn
         self.diff_loss_weight = 2.0
         self.ego_fut_mode = 20
-        self.num_goal_points = config.num_goal_points
-        self.goal_uncertainty_logit_weight = config.goal_uncertainty_logit_weight
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
@@ -803,130 +766,6 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
         odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
-
-    def _prepare_goal_inputs(
-        self,
-        goalpoint,
-        points_score,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if goalpoint is None:
-            raise ValueError("Mimir trajectory head requires goal points. Set navi_path or use_gt_goal_train=True.")
-
-        goalpoint = self._to_goal_tensor(goalpoint, batch_size, device, dtype, feature_dim=2)
-        points_score = self._to_goal_tensor(points_score, batch_size, device, dtype, feature_dim=2, like=goalpoint)
-        goal_log_prior = self._goal_log_prior(points_score)
-        return goalpoint, points_score, goal_log_prior
-
-    def _to_goal_tensor(
-        self,
-        value,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-        feature_dim: int,
-        like: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if value is None:
-            return torch.zeros_like(like) if like is not None else torch.zeros(
-                batch_size,
-                self.num_goal_points,
-                feature_dim,
-                device=device,
-                dtype=dtype,
-            )
-
-        if not torch.is_tensor(value):
-            value = torch.as_tensor(value, device=device, dtype=dtype)
-        else:
-            value = value.to(device=device, dtype=dtype)
-
-        if value.ndim == 0:
-            value = value.view(1, 1, 1)
-        elif value.ndim == 1:
-            value = value.view(1, 1, -1)
-        elif value.ndim == 2:
-            if value.shape[0] == batch_size:
-                if value.shape[1] == feature_dim:
-                    value = value[:, None, :]
-                else:
-                    value = value[..., None]
-            else:
-                value = value[None, :, :]
-        elif value.ndim > 3:
-            value = value.reshape(value.shape[0], -1, value.shape[-1])
-
-        if value.shape[0] == 1 and batch_size > 1:
-            value = value.expand(batch_size, -1, -1)
-
-        if value.shape[0] != batch_size:
-            raise ValueError(f"Expected goal batch size {batch_size}, got {value.shape[0]}.")
-
-        if value.shape[-1] < feature_dim:
-            value = value.expand(*value.shape[:-1], feature_dim)
-        elif value.shape[-1] > feature_dim:
-            value = value[..., :feature_dim]
-
-        if value.shape[1] < self.num_goal_points:
-            pad = value[:, -1:, :].expand(-1, self.num_goal_points - value.shape[1], -1)
-            value = torch.cat([value, pad], dim=1)
-
-        return value[:, :self.num_goal_points, :]
-
-    def _goal_log_prior(self, points_score: torch.Tensor) -> torch.Tensor:
-        if points_score.numel() == 0 or self.goal_uncertainty_logit_weight == 0:
-            return torch.zeros(points_score.shape[:2], device=points_score.device, dtype=points_score.dtype)
-
-        uncertainty = torch.linalg.norm(points_score.float(), dim=-1)
-        goal_log_prior = -self.goal_uncertainty_logit_weight * uncertainty
-        goal_log_prior = goal_log_prior - torch.logsumexp(goal_log_prior, dim=1, keepdim=True)
-        return goal_log_prior.to(points_score.dtype)
-
-    @staticmethod
-    def _repeat_goal_branches(tensor: torch.Tensor, num_goal_points: int) -> torch.Tensor:
-        return tensor.repeat_interleave(num_goal_points, dim=0)
-
-    @staticmethod
-    def _select_goal_branch(tensor: torch.Tensor, branch_idx: torch.Tensor) -> torch.Tensor:
-        batch_idx = torch.arange(tensor.shape[0], device=tensor.device)
-        return tensor[batch_idx, branch_idx]
-
-    def _multi_goal_trajectory_loss(
-        self,
-        poses_reg: torch.Tensor,
-        poses_cls: torch.Tensor,
-        targets: Dict[str, torch.Tensor],
-        plan_anchor: torch.Tensor,
-        matched_goal_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        bs, num_goal_points, _, ts, d = poses_reg.shape
-        target_traj = targets["trajectory"]
-        anchor_dist = torch.linalg.norm(target_traj.unsqueeze(1)[..., :2] - plan_anchor, dim=-1)
-        anchor_dist = anchor_dist.mean(dim=-1)
-        mode_idx = torch.argmin(anchor_dist, dim=-1)
-
-        target_classes_onehot = torch.zeros_like(poses_cls)
-        batch_idx = torch.arange(bs, device=poses_cls.device)
-        target_classes_onehot[batch_idx, matched_goal_idx, mode_idx] = 1
-
-        loss_cls = self.loss_computer.cls_loss_weight * py_sigmoid_focal_loss(
-            poses_cls.flatten(1),
-            target_classes_onehot.flatten(1),
-            weight=None,
-            gamma=2.0,
-            alpha=0.25,
-            reduction='mean',
-            avg_factor=None,
-        )
-
-        selected_reg = self._select_goal_branch(poses_reg, matched_goal_idx)
-        gather_idx = mode_idx[:, None, None, None].repeat(1, 1, ts, d)
-        best_reg = torch.gather(selected_reg, 1, gather_idx).squeeze(1)
-        reg_loss = self.loss_computer.reg_loss_weight * F.l1_loss(best_reg, target_traj)
-        return loss_cls + reg_loss
-
     def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,goalpoint=None,points_score=1.0) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
         if self.training:
@@ -938,26 +777,12 @@ class TrajectoryHead(nn.Module):
     def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,goalpoint=None,points_score=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
-        dtype = ego_query.dtype
-        goalpoint, points_score, _ = self._prepare_goal_inputs(goalpoint, points_score, bs, device, dtype)
-        num_goal_points = goalpoint.shape[1]
-        branch_bs = bs * num_goal_points
-        goalpoint_flat = goalpoint.reshape(branch_bs, 1, 2)
-        points_score_flat = points_score.reshape(branch_bs, 1, 2)
-        ego_query = self._repeat_goal_branches(ego_query, num_goal_points)
-        agents_query = self._repeat_goal_branches(agents_query, num_goal_points)
-        bev_feature = self._repeat_goal_branches(bev_feature, num_goal_points)
-        status_encoding = self._repeat_goal_branches(status_encoding, num_goal_points)
-        if global_img is not None:
-            global_img = self._repeat_goal_branches(global_img, num_goal_points)
-
         # 1. add truncated noise to the plan anchor
-        plan_anchor_single = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
-        plan_anchor = plan_anchor_single.repeat_interleave(num_goal_points, dim=0)
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         odo_info_fut = self.norm_odo(plan_anchor)
         timesteps = torch.randint(
             0, 50,
-            (branch_bs,), device=device
+            (bs,), device=device
         )
         noise = torch.randn(odo_info_fut.shape, device=device)
         noisy_traj_points = self.diffusion_scheduler.add_noise(
@@ -973,51 +798,30 @@ class TrajectoryHead(nn.Module):
         traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
         traj_pos_embed = traj_pos_embed.flatten(-2)
         traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-        goal_info_embed=gen_sineembed_for_position(torch.cat([goalpoint_flat,points_score_flat],dim=-2),hidden_dim=128)
+        goal_info_embed=gen_sineembed_for_position(torch.cat([goalpoint,points_score],dim=-2),hidden_dim=128)
         goal_info_embed=goal_info_embed.flatten(-2)
         goal_info_feature=self.goalpoint_encoder(goal_info_embed)
-        traj_feature = traj_feature.view(branch_bs,ego_fut_mode,-1)+goal_info_feature.view(branch_bs,1,-1)
+        traj_feature = traj_feature.view(bs,ego_fut_mode,-1)+goal_info_feature.view(bs,1,-1)
         # traj_feature = traj_feature.view(bs,ego_fut_mode,-1)
         # 3. embed the timesteps
         time_embed = self.time_mlp(timesteps)
-        time_embed = time_embed.view(branch_bs,1,-1)
+        time_embed = time_embed.view(bs,1,-1)
 
-        navi_points=goalpoint_flat
+        navi_points=goalpoint
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score_flat)
-
-        target_goal = targets["trajectory"][:, -1, :2]
-        goal_dist = torch.linalg.norm(goalpoint - target_goal[:, None, :], dim=-1)
-        matched_goal_idx = goal_dist.argmin(dim=-1)
+        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score)
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            poses_reg = poses_reg.view(bs, num_goal_points, self.ego_fut_mode, self._num_poses, 3)
-            poses_cls = poses_cls.view(bs, num_goal_points, self.ego_fut_mode)
-            trajectory_loss = self._multi_goal_trajectory_loss(
-                poses_reg,
-                poses_cls,
-                targets,
-                plan_anchor_single,
-                matched_goal_idx,
-            )
+            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor)
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 
-        final_reg = poses_reg_list[-1].view(bs, num_goal_points, self.ego_fut_mode, self._num_poses, 3)
-        final_cls = poses_cls_list[-1].view(bs, num_goal_points, self.ego_fut_mode)
-        selected_final_reg = self._select_goal_branch(final_reg, matched_goal_idx)
-        selected_final_cls = self._select_goal_branch(final_cls, matched_goal_idx)
-        mode_idx = selected_final_cls.argmax(dim=-1)
+        mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
-        best_reg = torch.gather(selected_final_reg, 1, mode_idx).squeeze(1)
-        return {
-            "trajectory": best_reg,
-            "trajectory_loss":ret_traj_loss,
-            "trajectory_loss_dict":trajectory_loss_dict,
-            "matched_goal_idx": matched_goal_idx,
-        }
+        best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
+        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,goalpoint=None,points_score=1.0) -> Dict[str, torch.Tensor]:
         step_num = 2
@@ -1025,18 +829,6 @@ class TrajectoryHead(nn.Module):
         anchor = 20
         num_samples = 64
         device = ego_query.device
-        dtype = ego_query.dtype
-        goalpoint, points_score, goal_log_prior = self._prepare_goal_inputs(goalpoint, points_score, bs, device, dtype)
-        num_goal_points = goalpoint.shape[1]
-        branch_bs = bs * num_goal_points
-        goalpoint_flat = goalpoint.reshape(branch_bs, 1, 2)
-        points_score_flat = points_score.reshape(branch_bs, 1, 2)
-        ego_query = self._repeat_goal_branches(ego_query, num_goal_points)
-        agents_query = self._repeat_goal_branches(agents_query, num_goal_points)
-        bev_feature = self._repeat_goal_branches(bev_feature, num_goal_points)
-        status_encoding = self._repeat_goal_branches(status_encoding, num_goal_points)
-        if global_img is not None:
-            global_img = self._repeat_goal_branches(global_img, num_goal_points)
         self.diffusion_scheduler.set_timesteps(1000, device)
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
@@ -1044,12 +836,12 @@ class TrajectoryHead(nn.Module):
 
 
         # 1. add truncated noise to the plan anchor
-        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(branch_bs,1,1,1)
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         plan_anchor = plan_anchor.unsqueeze(2).repeat(1,1,num_samples,1,1)
-        plan_anchor = plan_anchor.view(branch_bs,num_samples*anchor, 8, 2)
+        plan_anchor = plan_anchor.view(bs,num_samples*anchor, 8, 2)
         img = self.norm_odo(plan_anchor)
         noise = torch.randn(img.shape, device=device)
-        trunc_timesteps = torch.ones((branch_bs,), device=device, dtype=torch.long) * 8
+        trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
         img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
         noisy_trajs = self.denorm_odo(img)
         ego_fut_mode = img.shape[1]
@@ -1061,10 +853,10 @@ class TrajectoryHead(nn.Module):
             traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-            goal_info_embed=gen_sineembed_for_position(torch.cat([goalpoint_flat,points_score_flat],dim=-2),hidden_dim=128)
+            goal_info_embed=gen_sineembed_for_position(torch.cat([goalpoint,points_score],dim=-2),hidden_dim=128)
             goal_info_embed=goal_info_embed.flatten(-2)
             goal_info_feature=self.goalpoint_encoder(goal_info_embed)
-            traj_feature = traj_feature.view(branch_bs,ego_fut_mode,-1)+goal_info_feature.view(branch_bs,1,-1)
+            traj_feature = traj_feature.view(bs,ego_fut_mode,-1)+goal_info_feature.view(bs,1,-1)
 
             timesteps = k
             if not torch.is_tensor(timesteps):
@@ -1076,11 +868,11 @@ class TrajectoryHead(nn.Module):
             # 3. embed the timesteps
             timesteps = timesteps.expand(img.shape[0])
             time_embed = self.time_mlp(timesteps)
-            time_embed = time_embed.view(branch_bs,1,-1)
+            time_embed = time_embed.view(bs,1,-1)
 
             # 4. begin the stacked decoder
-            navi_points = goalpoint_flat
-            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score_flat)
+            navi_points = goalpoint
+            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score)
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
@@ -1090,18 +882,11 @@ class TrajectoryHead(nn.Module):
                 timestep=k,
                 sample=img
             ).prev_sample
-        num_candidates = anchor * num_samples
-        poses_reg = poses_reg.view(bs, num_goal_points, num_candidates, self._num_poses, 3)
-        poses_cls = poses_cls.view(bs, num_goal_points, num_candidates)
-        selection_logits = poses_cls + goal_log_prior[:, :, None]
-        flat_mode_idx = selection_logits.flatten(1).argmax(dim=-1)
-        flat_poses_reg = poses_reg.flatten(1, 2)
-        gather_idx = flat_mode_idx[:, None, None, None].repeat(1, 1, self._num_poses, 3)
-        best_reg = torch.gather(flat_poses_reg, 1, gather_idx).squeeze(1)
-        anchor_trajectories = poses_reg.view(bs, num_goal_points, anchor, num_samples, self._num_poses, 3)
+        mode_idx = poses_cls.argmax(dim=-1)
+        mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
+        best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
+        poses_reg = poses_reg.view(bs, anchor, num_samples, self._num_poses, 3)
                 
         return {"trajectory": best_reg,
-                'anchor_trajectories': anchor_trajectories,
-                "goal_points": goalpoint,
-                "goal_logits": goal_log_prior,
+                'anchor_trajectories': poses_reg
                 }

@@ -4,7 +4,7 @@ from scipy.optimize import linear_sum_assignment
 import torch
 import torch.nn.functional as F
 
-from navsim.agents.mimir.mimir_config import MimirConfig
+from navsim.agents.mimir.mimir_config_unc import MimirConfig
 from navsim.agents.mimir.mimir_features import BoundingBox2DIndex
 from navsim.agents.mimir.modules.multimodal_loss import LaplaceNLLLoss
 
@@ -35,8 +35,20 @@ def mimir_loss(
         diffusion_loss = predictions['diffusion_loss']
     else:
         diffusion_loss = 0
+    if "goal_selection_loss" in predictions:
+        goal_selection_loss = predictions["goal_selection_loss"]
+        goal_selection_target = predictions.get("goal_selection_target")
+    elif "anchor_trajectories" in predictions:
+        selected_goal = predictions["anchor_trajectories"][..., :2]
+        gt_endpoint = targets["trajectory"][:, 7:8, :2].to(selected_goal)
+        goal_selection_loss = torch.linalg.norm(selected_goal - gt_endpoint, dim=-1).mean()
+        goal_selection_target = None
+    else:
+        goal_selection_loss = 0.0
+        goal_selection_target = None
     loss = (
         config.trajectory_weight * trajectory_loss
+        + config.goal_selection_weight * goal_selection_loss
         + config.diff_loss_weight * diffusion_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
@@ -45,6 +57,7 @@ def mimir_loss(
     loss_dict = {
         'loss': loss,
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
+        'goal_selection_loss': config.goal_selection_weight*goal_selection_loss,
         'diffusion_loss': config.diff_loss_weight*diffusion_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
@@ -53,6 +66,12 @@ def mimir_loss(
     if "trajectory_loss_dict" in predictions:
         trajectory_loss_dict = predictions["trajectory_loss_dict"]
         loss_dict.update(trajectory_loss_dict)
+    if "goal_selection_logits" in predictions and goal_selection_target is not None:
+        with torch.no_grad():
+            goal_selection_acc = (
+                predictions["goal_selection_logits"].argmax(dim=1) == goal_selection_target
+            ).float().mean()
+        loss_dict["goal_selection_acc"] = goal_selection_acc
     # import ipdb; ipdb.set_trace()
     return loss_dict
 

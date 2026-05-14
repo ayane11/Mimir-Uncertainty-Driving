@@ -6,18 +6,28 @@ from nuplan.common.maps.abstract_map import SemanticMapLayer
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.planning.simulation.trajectory.trajectory_sampling import TrajectorySampling
 
-
 @dataclass
 class MimirConfig:
-    """Global Mimir config."""
 
+    """Global Mimir config."""
+    training: False
+    use_proj_image: False
+    use_gt_goal_train: True
+    status_norm: False
+    use_unc_score: False
     trajectory_sampling: TrajectorySampling = TrajectorySampling(time_horizon=4, interval_length=0.5)
 
+    goal_coord_path: str = ''
+    navi_unc_outputdir: str = ''
+
+    unc_path: str=''
+    navi_path: str=''
     image_architecture: str = "resnet34"
     lidar_architecture: str = "resnet34"
-    bkb_path: str = "/home/users/bencheng.liao/.cache/huggingface/hub/checkpoints/resnet34.a1_in1k/pytorch_model.bin"
-    plan_anchor_path: str = "/home/users/bencheng.liao/PlanWrapper/playground/visualization/kmeans_navsim_traj_20.npy"
+    bkb_path: str = "/home/navsim/ckpt/resnet34.a1_in1k/pytorch_model.bin"
+    plan_anchor_path: str = "/home/navsim/dataset/kmeans_navsim_traj_20.npy"
 
+    # lidar_latent: 
     latent: bool = False
     latent_rad_thresh: float = 4 * np.pi / 9
 
@@ -83,6 +93,13 @@ class MimirConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
+    use_wm: bool = False
+    wm_loss_weight: float = 6.0
+    wm_num_future_frames: int = 3
+    wm_num_layers: int = 1
+    wm_num_head: int = 8
+    wm_d_ffn: int = 512
+    wm_dropout: float = 0.0
     agent_class_weight: float = 10.0
     agent_box_weight: float = 1.0
     bev_semantic_weight: float = 14.0

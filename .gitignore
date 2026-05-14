@@ -3,7 +3,7 @@
 **/__pycache__/
 .pytest_cache/*
 .pydevproject
-
+gtrs_traj/
 # IDE
 .vscode/*
 

@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import logging
 import pickle
@@ -37,6 +37,8 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         feature_builders: List[AbstractFeatureBuilder],
         target_builders: List[AbstractTargetBuilder],
         log_names: Optional[List[str]] = None,
+        metric_cache_path: Optional[str] = None,
+        metric_cache_scenario_type: str = "unknown",
     ):
         """
         Initializes the dataset module.
@@ -56,6 +58,8 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
 
         self._feature_builders = feature_builders
         self._target_builders = target_builders
+        self._metric_cache_path = Path(metric_cache_path) if metric_cache_path else None
+        self._metric_cache_scenario_type = metric_cache_scenario_type
         self._valid_cache_paths: Dict[str, Path] = self._load_valid_caches(
             cache_path=self._cache_path,
             feature_builders=self._feature_builders,
@@ -70,7 +74,13 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         """
         return len(self.tokens)
 
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    def __getitem__(
+        self,
+        idx: int,
+    ) -> Union[
+        Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
+        Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], str, str],
+    ]:
         """
         Loads and returns pair of feature and target dict from data.
         :param idx: index of sample to load.
@@ -108,7 +118,26 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
 
         return valid_cache_paths
 
-    def _load_scene_with_token(self, token: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    def _get_metric_cache_path(self, token_path: Path, token: str) -> Path:
+        if self._metric_cache_path is not None:
+            log_name = token_path.parent.name
+            return self._metric_cache_path / log_name / self._metric_cache_scenario_type / token / "metric_cache.pkl"
+
+        if "training_cache" in str(token_path):
+            pdm_token_path = str(token_path).replace("training_cache", "train_pdm_cache")
+            pdm_token_path_parts = pdm_token_path.split("/")
+            pdm_token_path_parts.insert(-1, "unknown")
+            return Path("/".join(pdm_token_path_parts)) / "metric_cache.pkl"
+
+        return token_path / "metric_cache.pkl"
+
+    def _load_scene_with_token(
+        self,
+        token: str,
+    ) -> Union[
+        Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]],
+        Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], str, str],
+    ]:
         """
         Helper method to load sample tensors given token
         :param token: unique string identifier of sample
@@ -129,6 +158,9 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
             data_dict_path = token_path / (builder.get_unique_name() + ".gz")
             data_dict = load_feature_target_from_pickle(data_dict_path)
             targets.update(data_dict)
+
+        if self._metric_cache_path is not None:
+            return (features, targets, str(self._get_metric_cache_path(token_path, token)), token)
 
         return (features, targets)
 

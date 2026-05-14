@@ -9,7 +9,7 @@ from nuplan.planning.simulation.trajectory.trajectory_sampling import Trajectory
 @dataclass
 class MimirConfig:
 
-    """Global TransFuser config."""
+    """Global Mimir config."""
     training: False
     use_proj_image: False
     use_gt_goal_train: True

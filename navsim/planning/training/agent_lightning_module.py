@@ -24,14 +24,22 @@ class AgentLightningModule(pl.LightningModule):
         :param logging_prefix: prefix where to log step
         :return: scalar loss
         """
-        features, targets = batch
-        prediction = self.agent.forward(features, targets)
+        if len(batch) == 2:
+            features, targets = batch
+            prediction = self.agent.forward(features, targets)
+        else:
+            features, targets, pdm_token_path, token = batch
+            prediction = self.agent.forward(features, targets, pdm_token_path, token)
 
         loss_dict = self.agent.compute_loss(features, targets, prediction)
 
+        try:
+            current_batch_size = next(iter(features.values())).shape[0]
+        except (StopIteration, AttributeError):
+            current_batch_size = 1
         for k, v in loss_dict.items():
             if v is not None:
-                self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(batch[0]))
+                self.log(f"{logging_prefix}/{k}", v, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=current_batch_size)
         return loss_dict['loss']
 
     def training_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int) -> Tensor:

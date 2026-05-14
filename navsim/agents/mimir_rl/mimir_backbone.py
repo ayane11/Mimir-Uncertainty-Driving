@@ -173,14 +173,17 @@ class MimirBackbone(nn.Module):
             image_features = self.forward_layer_block(image_layers, self.image_encoder.return_layers, image_features)
             lidar_features = self.forward_layer_block(lidar_layers, self.lidar_encoder.return_layers, lidar_features)
 
+            if i==2:
+                image_features_grid=image_features
             image_features, lidar_features = self.fuse_features(image_features, lidar_features, i)
 
         if self.config.detect_boxes or self.config.use_bev_semantic:
             x4 = lidar_features
 
-        image_feature_grid = None
-        if self.config.use_semantic or self.config.use_depth:
-            image_feature_grid = image_features
+        # image_feature_grid = None
+        # if self.config.use_semantic or self.config.use_depth:
+        #     image_feature_grid = image_features
+        # image_feature_grid=image_features
 
         if self.config.transformer_decoder_join:
             fused_features = lidar_features
@@ -201,7 +204,7 @@ class MimirBackbone(nn.Module):
         else:
             features = None
 
-        return features, fused_features, image_feature_grid
+        return features, fused_features, image_features_grid
 
     def forward_layer_block(self, layers, return_layers, features):
         """
@@ -220,7 +223,7 @@ class MimirBackbone(nn.Module):
 
     def fuse_features(self, image_features, lidar_features, layer_idx):
         """
-        Perform a TransFuser feature fusion block using a Transformer module.
+        Perform a Mimir feature fusion block using a Transformer module.
         :param image_features: Features from the image branch
         :param lidar_features: Features from the LiDAR branch
         :param layer_idx: Transformer layer index.

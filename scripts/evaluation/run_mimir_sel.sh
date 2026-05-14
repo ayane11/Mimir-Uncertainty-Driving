@@ -9,6 +9,7 @@ export OPENBLAS_CORETYPE=Haswell
 # ====================================== use unc to train ==============================================================
 CHECKPOINT_PATH='/home/navsim/exp/a_navtrain_mimir_agent_traj/mimir_wm/lightning_logs/version_0/checkpoints/epoch\=94-step\=126350.ckpt'
 GOAL_COORD_PATH='/home/navsim/dataset/naviunc/navtest_naviunc/navi.npy'
+METRIC_CACHE_PATH='/home/navsim/exp/cache/navtest_metric/cache'
 UNC_PATH='/home/navsim/dataset/naviunc/navtest_naviunc/unc.npy'
 TRAJ_SAVE_PATH='/home/navsim/dataset/trajs'
 
@@ -17,6 +18,7 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
     train_test_split=navtest \
     experiment_name=a_navtest_mimir_agent_traj_eval \
     worker=ray_distributed \
+    metric_cache_path=$METRIC_CACHE_PATH \
     agent.traj_save_path=$TRAJ_SAVE_PATH \
     agent.config.latent=False \
     agent.config.training=False \

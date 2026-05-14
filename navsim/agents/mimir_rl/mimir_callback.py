@@ -123,7 +123,7 @@ class MimirCallback(pl.Callback):
         predictions: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """
-        Create tile of input-output visualizations for TransFuser.
+        Create tile of input-output visualizations for Mimir.
         :param features: dictionary of feature names and tensors
         :param targets: dictionary of target names and tensors
         :param predictions: dictionary of target names and predicted tensors
@@ -181,7 +181,7 @@ def semantic_map_to_rgb(semantic_map: npt.NDArray[np.int64], config: MimirConfig
     """
     Convert semantic map to RGB image.
     :param semantic_map: numpy array of segmentation map (multi-channel)
-    :param config: global config dataclass of TransFuser
+    :param config: global config dataclass of Mimir
     :return: RGB image as numpy array
     """
 
@@ -219,7 +219,7 @@ def lidar_map_to_rgb(
     :param pred_agent_states: predicted agent bounding box states
     :param trajectory: target trajectory of human operator
     :param pred_trajectory: predicted trajectory of agent
-    :param config: global config dataclass of TransFuser
+    :param config: global config dataclass of Mimir
     :return: RGB image for training visualization
     """
     gt_color, pred_color = (0, 255, 0), (255, 0, 0)
@@ -272,7 +272,7 @@ def debug_lidar_map_to_rgb(
     :param pred_agent_states: predicted agent bounding box states
     :param trajectory: target trajectory of human operator
     :param pred_trajectory: predicted trajectory of agent
-    :param config: global config dataclass of TransFuser
+    :param config: global config dataclass of Mimir
     :return: RGB image for training visualization
     """
     import ipdb; ipdb.set_trace()

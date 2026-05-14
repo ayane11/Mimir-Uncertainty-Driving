@@ -31,9 +31,14 @@ def mimir_loss(
         diffusion_loss = predictions['diffusion_loss']
     else:
         diffusion_loss = 0
+    if "wm_future_bev_semantic_map" in predictions and "wm_future_bev_semantic_map" in targets:
+        wm_loss = _world_model_future_bev_semantic_loss(targets, predictions)
+    else:
+        wm_loss = 0.0
     loss = (
         config.trajectory_weight * trajectory_loss
         + config.diff_loss_weight * diffusion_loss
+        + config.wm_loss_weight * wm_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
         + config.bev_semantic_weight * bev_semantic_loss
@@ -42,6 +47,7 @@ def mimir_loss(
         'loss': loss,
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
         'diffusion_loss': config.diff_loss_weight*diffusion_loss,
+        'wm_loss': config.wm_loss_weight*wm_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
         'bev_semantic_loss': config.bev_semantic_weight*bev_semantic_loss
@@ -49,8 +55,27 @@ def mimir_loss(
     if "trajectory_loss_dict" in predictions:
         trajectory_loss_dict = predictions["trajectory_loss_dict"]
         loss_dict.update(trajectory_loss_dict)
+    if "wm_prev_trajectory_loss_dict" in predictions:
+        loss_dict.update(predictions["wm_prev_trajectory_loss_dict"])
     # import ipdb; ipdb.set_trace()
     return loss_dict
+
+def _world_model_future_bev_semantic_loss(
+    targets: Dict[str, torch.Tensor],
+    predictions: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Cross-entropy loss for autoregressively predicted future ego-frame BEV semantic maps."""
+
+    pred_maps = predictions["wm_future_bev_semantic_map"]
+    target_maps = targets["wm_future_bev_semantic_map"].long()
+
+    if target_maps.ndim == 3:
+        target_maps = target_maps[:, None]
+
+    batch_size, num_future_frames, num_classes, height, width = pred_maps.shape
+    pred_maps = pred_maps.reshape(batch_size * num_future_frames, num_classes, height, width)
+    target_maps = target_maps.reshape(batch_size * num_future_frames, height, width)
+    return F.cross_entropy(pred_maps, target_maps)
 
 
 def _agent_loss(

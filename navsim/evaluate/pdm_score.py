@@ -138,3 +138,150 @@ def pdm_score(
         driving_direction_compliance,
         score,
     )
+
+
+
+from typing import Sequence, Union, List
+import numpy as np
+
+def _pdm_score_single(
+    metric_cache: MetricCache,
+    model_trajectory: Trajectory,
+    future_sampling: TrajectorySampling,
+    simulator: PDMSimulator,
+    scorer: PDMScorer,
+) -> PDMResults:
+    """原先的单条实现，代码完全不变"""
+    initial_ego_state = metric_cache.ego_state
+
+    pdm_trajectory = metric_cache.trajectory
+    pred_trajectory = transform_trajectory(model_trajectory, initial_ego_state)
+
+    pdm_states, pred_states = (
+        get_trajectory_as_array(pdm_trajectory,
+                                future_sampling,
+                                initial_ego_state.time_point),
+        get_trajectory_as_array(pred_trajectory,
+                                future_sampling,
+                                initial_ego_state.time_point),
+    )
+
+    trajectory_states = np.concatenate([pdm_states[None, ...],
+                                        pred_states[None, ...]],
+                                       axis=0)
+
+    simulated_states = simulator.simulate_proposals(
+        trajectory_states, initial_ego_state)
+
+    scores = scorer.score_proposals(
+        simulated_states,
+        metric_cache.observation,
+        metric_cache.centerline,
+        metric_cache.route_lane_ids,
+        metric_cache.drivable_area_map,
+    )
+
+    # ----- 从 scorer 中取回各项指标 ----------
+    pred_idx = 1
+    no_at_fault_collisions     = scorer._multi_metrics[MultiMetricIndex.NO_COLLISION,    pred_idx]
+    drivable_area_compliance   = scorer._multi_metrics[MultiMetricIndex.DRIVABLE_AREA,    pred_idx]
+    ego_progress               = scorer._weighted_metrics[WeightedMetricIndex.PROGRESS,   pred_idx]
+    time_to_collision_in_bound = scorer._weighted_metrics[WeightedMetricIndex.TTC,        pred_idx]
+    comfort                    = scorer._weighted_metrics[WeightedMetricIndex.COMFORTABLE,pred_idx]
+    driving_dir_compliance     = scorer._weighted_metrics[WeightedMetricIndex.DRIVING_DIRECTION, pred_idx]
+    score                      = scores[pred_idx]
+
+    return PDMResults(
+        no_at_fault_collisions,
+        drivable_area_compliance,
+        ego_progress,
+        time_to_collision_in_bound,
+        comfort,
+        driving_dir_compliance,
+        score,
+    )
+
+# ---- 新的“批量 + 单条”统一入口 ---------------------------------------------
+def pdm_score_para(
+    metric_cache: MetricCache,
+    model_trajectory: Union[
+        Trajectory,
+        Sequence[Trajectory],
+        np.ndarray,               # (N, T+1, 3)
+    ],
+    future_sampling: TrajectorySampling,
+    simulator: PDMSimulator,
+    scorer: PDMScorer,
+) -> Union[PDMResults, List[PDMResults]]:
+    """
+    * 若 `model_trajectory` 是 **单条** Trajectory → 返回 PDMResults
+    * 若 `model_trajectory` 是 **批量** (list / ndarray) → 返回 List[PDMResults]，长度 = N
+    """
+    # --------- 单条情况：直接走旧实现 ----------
+    if isinstance(model_trajectory, Trajectory):
+        return _pdm_score_single(metric_cache,
+                                 model_trajectory,
+                                 future_sampling,
+                                 simulator,
+                                 scorer)
+
+    # --------- 解析批量输入 -------------------
+    if isinstance(model_trajectory, np.ndarray):
+        # ndarray ⇒ list[Trajectory]，假设最后两维是 (T+1, 3)
+        traj_list = [Trajectory(model_trajectory[i])
+                     for i in range(model_trajectory.shape[0])]
+    else:
+        # 已经是 list[Trajectory]
+        traj_list = list(model_trajectory)
+
+    N = len(traj_list)
+    if N == 0:
+        raise ValueError("Empty trajectory batch.")
+
+    initial_ego_state = metric_cache.ego_state
+    pdm_trajectory    = metric_cache.trajectory
+    pdm_states        = get_trajectory_as_array(
+        pdm_trajectory, future_sampling, initial_ego_state.time_point)
+
+    # —— 把 N 条预测轨迹变成 (N, T+1, dim) ----------
+    pred_states_batch = []
+    for traj in traj_list:
+        pred_world = transform_trajectory(traj, initial_ego_state)
+        pred_states = get_trajectory_as_array(
+            pred_world, future_sampling, initial_ego_state.time_point)
+        pred_states_batch.append(pred_states)
+    pred_states_batch = np.stack(pred_states_batch, axis=0)      # (N, T+1, dim)
+
+    # —— 拼成 (N+1, T+1, dim)，第 0 条是 GT ----------
+    trajectory_states = np.concatenate(
+        [pdm_states[None, ...], pred_states_batch], axis=0)
+
+    # —— 一次仿真 + 一次打分 ------------------------
+    simulated_states = simulator.simulate_proposals(
+        trajectory_states, initial_ego_state)
+
+    scores = scorer.score_proposals(
+        simulated_states,
+        metric_cache.observation,
+        metric_cache.centerline,
+        metric_cache.route_lane_ids,
+        metric_cache.drivable_area_map,
+    )
+
+    # --------- 把每条预测的指标拆出来 ----------
+    results: List[PDMResults] = []
+    for i in range(1, N + 1):               # 预测轨迹索引从 1 开始
+        results.append(
+            PDMResults(
+                scorer._multi_metrics[MultiMetricIndex.NO_COLLISION,        i],
+                scorer._multi_metrics[MultiMetricIndex.DRIVABLE_AREA,       i],
+                scorer._weighted_metrics[WeightedMetricIndex.PROGRESS,      i],
+                scorer._weighted_metrics[WeightedMetricIndex.TTC,           i],
+                scorer._weighted_metrics[WeightedMetricIndex.COMFORTABLE,   i],
+                scorer._weighted_metrics[WeightedMetricIndex.DRIVING_DIRECTION, i],
+                scores[i],
+            )
+        )
+    # sim_pred = trajectory_states[1:]
+    sim_pred = simulated_states[1:]
+    return results, sim_pred

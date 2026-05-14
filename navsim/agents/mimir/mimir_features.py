@@ -24,12 +24,12 @@ from navsim.planning.training.abstract_feature_target_builder import AbstractFea
 
 
 class MimirFeatureBuilder(AbstractFeatureBuilder):
-    """Input feature builder for TransFuser."""
+    """Input feature builder for Mimir."""
 
     def __init__(self, config: MimirConfig):
         """
         Initializes feature builder.
-        :param config: global config dataclass of TransFuser
+        :param config: global config dataclass of Mimir
         """
         self._config = config
 
@@ -44,7 +44,6 @@ class MimirFeatureBuilder(AbstractFeatureBuilder):
         features["camera_feature"] = self._get_camera_feature(agent_input)
         if not self._config.latent:
             features["lidar_feature"] = self._get_lidar_feature(agent_input)
-        
         features["status_feature"] = torch.concatenate(
             [
                 torch.tensor(agent_input.ego_statuses[-1].driving_command, dtype=torch.float32),
@@ -136,12 +135,12 @@ class MimirFeatureBuilder(AbstractFeatureBuilder):
 
 
 class MimirTargetBuilder(AbstractTargetBuilder):
-    """Output target builder for TransFuser."""
+    """Output target builder for Mimir."""
 
     def __init__(self, config: MimirConfig):
         """
         Initializes target builder.
-        :param config: global config dataclass of TransFuser
+        :param config: global config dataclass of Mimir
         """
         self._config = config
 
@@ -396,7 +395,7 @@ class MimirTargetBuilder(AbstractTargetBuilder):
 
 
 class BoundingBox2DIndex(IntEnum):
-    """Intenum for bounding boxes in TransFuser."""
+    """Intenum for bounding boxes in Mimir."""
 
     _X = 0
     _Y = 1

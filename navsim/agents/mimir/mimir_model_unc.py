@@ -554,6 +554,11 @@ class TrajectoryHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.LayerNorm(d_model),
         )
+        self.goal_selector_fusion = nn.Sequential(
+            nn.Linear(d_model * 3, d_model),
+            nn.ReLU(inplace=True),
+            nn.LayerNorm(d_model),
+        )
         self.goal_selector_agent_attention = nn.MultiheadAttention(
             d_model,
             config.tf_num_head,
@@ -607,7 +612,10 @@ class TrajectoryHead(nn.Module):
         if status_encoding.ndim == 3:
             status_encoding = status_encoding.squeeze(1)
         status_feature = self.goal_selector_status_encoder(status_encoding).unsqueeze(1)
-        selector_feature = goal_feature + status_feature + bev_goal_feature
+        status_feature = status_feature.expand(-1, goal_feature.shape[1], -1)
+        selector_feature = self.goal_selector_fusion(
+            torch.cat([goal_feature, status_feature, bev_goal_feature], dim=-1)
+        )
         agent_context = self.goal_selector_agent_attention(selector_feature, agents_query, agents_query)[0]
         selector_feature = self.goal_selector_agent_norm(selector_feature + agent_context)
         goal_logits = self.goal_selector_head(selector_feature).squeeze(-1)
@@ -687,7 +695,7 @@ class TrajectoryHead(nn.Module):
             unc_navi_loss += navi_loss
 
         best_reg = poses_reg_list[-1].squeeze(1)
-        output = {"navi": best_reg,"trajectory_loss":unc_navi_loss,"trajectory_loss_dict":navi_loss_dict}
+        output = {"navi": best_reg, "unc": poses_unc_list[-1],"trajectory_loss": unc_navi_loss,"trajectory_loss_dict": navi_loss_dict}
         if goal_selection_loss is not None:
             output["goal_selection_loss"] = goal_selection_loss
             output["goal_selection_logits"] = goal_selection_logits

@@ -212,7 +212,7 @@ class MimirAgent(AbstractAgent):
         return [MimirCallback(self._config),
         pl.callbacks.ModelCheckpoint(every_n_epochs=5, save_top_k=2, monitor="epoch", mode="max"), 
         pl.callbacks.ModelCheckpoint(
-            monitor="val/trajectory_loss_epoch",
+            monitor="train/trajectory_loss_epoch",
             mode="min",
             save_top_k=1,
             save_last=True,

@@ -91,7 +91,7 @@ class MimirConfig:
     trajectory_weight: float = 20.0
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
-    goal_selection_weight: float = 5.0
+    goal_selection_weight: float = 10.0
     goal_selector_temperature: float = 1.0
     diff_loss_weight: float = 20.0
     agent_class_weight: float = 10.0

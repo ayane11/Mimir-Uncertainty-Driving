@@ -31,10 +31,6 @@ def mimir_loss(
     bev_semantic_loss = F.cross_entropy(
         predictions["bev_semantic_map"], targets["bev_semantic_map"].long()
     )
-    if 'diffusion_loss' in predictions:
-        diffusion_loss = predictions['diffusion_loss']
-    else:
-        diffusion_loss = 0
     if "goal_selection_loss" in predictions:
         goal_selection_loss = predictions["goal_selection_loss"]
         goal_selection_target = predictions.get("goal_selection_target")
@@ -49,7 +45,6 @@ def mimir_loss(
     loss = (
         config.trajectory_weight * trajectory_loss
         + config.goal_selection_weight * goal_selection_loss
-        + config.diff_loss_weight * diffusion_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
         + config.bev_semantic_weight * bev_semantic_loss
@@ -58,11 +53,22 @@ def mimir_loss(
         'loss': loss,
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
         'goal_selection_loss': config.goal_selection_weight*goal_selection_loss,
-        'diffusion_loss': config.diff_loss_weight*diffusion_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
         'bev_semantic_loss': config.bev_semantic_weight*bev_semantic_loss
     }
+    with torch.no_grad():
+        if "navi" in predictions:
+            pred_endpoint = predictions["navi"][..., :2]
+            if pred_endpoint.ndim == 3 and pred_endpoint.shape[-2] == 1:
+                pred_endpoint = pred_endpoint.squeeze(-2)
+            target_endpoint = targets["trajectory"][:, 7, :2].to(pred_endpoint)
+            loss_dict["endpoint_l1"] = F.l1_loss(pred_endpoint, target_endpoint)
+        if "unc" in predictions:
+            unc = predictions["unc"]
+            loss_dict["unc_mean"] = unc.mean()
+            loss_dict["unc_min"] = unc.min()
+            loss_dict["unc_max"] = unc.max()
     if "trajectory_loss_dict" in predictions:
         trajectory_loss_dict = predictions["trajectory_loss_dict"]
         loss_dict.update(trajectory_loss_dict)

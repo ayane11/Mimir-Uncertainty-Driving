@@ -241,6 +241,9 @@ class GridSampleCrossBEVAttention_navi(nn.Module):
             navi_points=navi_points.unsqueeze(1)
             navi_points=navi_points.unsqueeze(1)
             navi_points=navi_points.expand(-1,num_queries,-1,-1)
+        elif navi_points.ndim == 4:
+            if navi_points.shape[1] == 1:
+                navi_points = navi_points.expand(-1, num_queries, -1, -1)
         else:
             navi_points=navi_points.view(batch_size,1,1,2)
             navi_points=navi_points.expand(-1,num_queries,-1,-1)
@@ -274,6 +277,8 @@ class GridSampleCrossBEVAttention_navi(nn.Module):
 
         # print("point_score==============================================",point_score)
         # 64 1 1 1 
+        if torch.is_tensor(point_score) and point_score.ndim == 4:
+            point_score = point_score.mean(dim=-1).unsqueeze(1)
         attention_weights = attention_weights.unsqueeze(1)*point_score # (bs,1,num_queries,1)
         out = (attention_weights * sampled_features).sum(dim=-1)
         out = out.permute(0, 2, 1).contiguous()  # bs, num_queries, C
@@ -327,8 +332,12 @@ class GridSampleCrossBEVAttention_naviscore(nn.Module):
         # import pdb;pdb.set_trace()
         batch_size=bev_feature.shape[0]
         num_queries = queries.shape[1]
-        navi_points=navi_points.view(batch_size,1,1,2)
-        navi_points=navi_points.expand(-1,num_queries,-1,-1)
+        if navi_points.ndim == 4:
+            if navi_points.shape[1] == 1:
+                navi_points = navi_points.expand(-1, num_queries, -1, -1)
+        else:
+            navi_points=navi_points.view(batch_size,1,1,2)
+            navi_points=navi_points.expand(-1,num_queries,-1,-1)
         # 1 1280 1 2
         bs, num_queries, num_points, _ = navi_points.shape
         
@@ -343,8 +352,12 @@ class GridSampleCrossBEVAttention_naviscore(nn.Module):
         attention_weights = self.attention_weights(queries)
         attention_weights = attention_weights.view(bs, num_queries, num_points).softmax(-1)
 
-        point_score=point_score.view(bs,1,1,2)
-        point_score=point_score.expand(-1,num_queries,-1,-1)
+        if point_score.ndim == 4:
+            if point_score.shape[1] == 1:
+                point_score = point_score.expand(-1, num_queries, -1, -1)
+        else:
+            point_score=point_score.view(bs,1,1,2)
+            point_score=point_score.expand(-1,num_queries,-1,-1)
         attention_weights_score = self.attention_weights_score(gen_sineembed_for_position(point_score))
         attention_weights_score = attention_weights_score.view(bs,num_queries,num_points)
         

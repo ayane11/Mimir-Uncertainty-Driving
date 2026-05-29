@@ -121,7 +121,7 @@ class LossComputer(nn.Module):
         # self.focal_loss = FocalLoss(use_sigmoid=True, gamma=2.0, alpha=0.25, reduction='mean', loss_weight=1.0, activated=False)
         self.cls_loss_weight = config.trajectory_cls_weight
         self.reg_loss_weight = config.trajectory_reg_weight
-    def forward(self, poses_reg, poses_cls, targets, plan_anchor):
+    def forward(self, poses_reg, poses_cls, targets, plan_anchor, mode_idx=None, cls_avg_factor=None):
         """
         pred_traj: (bs, 20, 8, 3)
         pred_cls: (bs, 20)
@@ -133,9 +133,10 @@ class LossComputer(nn.Module):
         # print(targets)
         # import pdb;pdb.set_trace()
         target_traj = targets["trajectory"]
-        dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
-        dist = dist.mean(dim=-1)
-        mode_idx = torch.argmin(dist, dim=-1)
+        if mode_idx is None:
+            dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
+            dist = dist.mean(dim=-1)
+            mode_idx = torch.argmin(dist, dim=-1)
         cls_target = mode_idx
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,ts,d)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
@@ -155,7 +156,7 @@ class LossComputer(nn.Module):
             gamma=2.0,
             alpha=0.25,
             reduction='mean',
-            avg_factor=None
+            avg_factor=cls_avg_factor
         )
 
         # Calculate regression loss

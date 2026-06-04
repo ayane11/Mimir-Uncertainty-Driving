@@ -623,10 +623,16 @@ class CustomTransformerDecoderLayer(nn.Module):
                 global_img=None,
                 navi_points=None,
                 points_score=1.0,
+                navi_mask=None,
                 ):
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
         if navi_points is not None:
-            traj_feature = self.cross_bev_attention_navi(traj_feature,navi_points,bev_feature,bev_spatial_shape,points_score)
+            navi_traj_feature = self.cross_bev_attention_navi(traj_feature,navi_points,bev_feature,bev_spatial_shape,points_score)
+            if navi_mask is not None:
+                navi_mask = navi_mask.to(device=traj_feature.device, dtype=traj_feature.dtype)
+                traj_feature = traj_feature + (navi_traj_feature - traj_feature) * navi_mask
+            else:
+                traj_feature = navi_traj_feature
         
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
         traj_feature = self.norm1(traj_feature)
@@ -677,12 +683,13 @@ class CustomTransformerDecoder(nn.Module):
                 global_img=None,
                 navi_points=None,
                 points_score=1.0,
+                navi_mask=None,
                 ):
         poses_reg_list = []
         poses_cls_list = []
         traj_points = noisy_traj_points
         for mod in self.layers:
-            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score=points_score)
+            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score=points_score,navi_mask=navi_mask)
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
             traj_points = poses_reg[...,:2].clone().detach()
@@ -745,8 +752,10 @@ class TrajectoryHead(nn.Module):
 
         self.loss_computer = LossComputer(config)
         self.use_gt_goal_train=config.use_gt_goal_train
+        self.use_endpoint_free_trajectory =config.use_endpoint_free_trajectory
 
     def _prepare_goal_inputs(self, goalpoint, points_score, bs, device, dtype):
+        has_goalpoint = goalpoint is not None
         if goalpoint is None:
             goalpoint = torch.zeros((bs, 1, 2), device=device, dtype=dtype)
         elif goalpoint.ndim != 3 or goalpoint.shape[0] != bs or goalpoint.shape[-1] != 2:
@@ -760,13 +769,69 @@ class TrajectoryHead(nn.Module):
             raise ValueError(f"Expected points_score shape {goalpoint.shape}, got {points_score.shape}.")
         else:
             points_score = points_score.to(device=device, dtype=dtype)
-        return goalpoint, points_score
+        return goalpoint, points_score, has_goalpoint
 
     def _encode_goal_condition(self, goalpoint, points_score):
         goal_condition = torch.stack([goalpoint, points_score], dim=2)
         goal_info_embed = gen_sineembed_for_position(goal_condition, hidden_dim=128)
         goal_info_embed = goal_info_embed.flatten(-2)
         return self.goalpoint_encoder(goal_info_embed)
+
+    def _build_goal_query_inputs(self, goalpoint, points_score, has_goalpoint, modes_per_goal):
+        bs = goalpoint.shape[0]
+        device = goalpoint.device
+        dtype = goalpoint.dtype
+        conditioned_goal_count = goalpoint.shape[1] if has_goalpoint else 0
+
+        if not self.use_endpoint_free_trajectory:
+            goal_info_feature = self._encode_goal_condition(goalpoint, points_score)
+            query_goalpoint, query_points_score = self._build_per_query_goal_inputs(
+                goalpoint,
+                points_score,
+                modes_per_goal,
+            )
+            navi_mask = torch.ones((bs, goalpoint.shape[1] * modes_per_goal, 1), device=device, dtype=dtype)
+            return goal_info_feature, query_goalpoint, query_points_score, navi_mask, conditioned_goal_count, goalpoint.shape[1]
+
+        if conditioned_goal_count > 0:
+            conditioned_goalpoint = goalpoint
+            conditioned_points_score = points_score
+            conditioned_goal_feature = self._encode_goal_condition(conditioned_goalpoint, conditioned_points_score)
+        else:
+            conditioned_goalpoint = goalpoint[:, :0, :]
+            conditioned_points_score = points_score[:, :0, :]
+            conditioned_goal_feature = goalpoint.new_zeros((bs, 0, self._d_model))
+
+        endpoint_free_goalpoint = goalpoint.new_zeros((bs, 1, 2))
+        endpoint_free_points_score = torch.zeros_like(endpoint_free_goalpoint)
+        endpoint_free_goal_feature = goalpoint.new_zeros((bs, 1, self._d_model))
+
+        candidate_goalpoint = torch.cat([conditioned_goalpoint, endpoint_free_goalpoint], dim=1)
+        candidate_points_score = torch.cat([conditioned_points_score, endpoint_free_points_score], dim=1)
+        goal_info_feature = torch.cat([conditioned_goal_feature, endpoint_free_goal_feature], dim=1)
+
+        query_goalpoint, query_points_score = self._build_per_query_goal_inputs(
+            candidate_goalpoint,
+            candidate_points_score,
+            modes_per_goal,
+        )
+        goal_mask = torch.cat(
+            [
+                torch.ones((bs, conditioned_goal_count, 1), device=device, dtype=dtype),
+                torch.zeros((bs, 1, 1), device=device, dtype=dtype),
+            ],
+            dim=1,
+        )
+        navi_mask = goal_mask[:, :, None, :].expand(-1, -1, modes_per_goal, -1)
+        navi_mask = navi_mask.reshape(bs, candidate_goalpoint.shape[1] * modes_per_goal, 1)
+        return (
+            goal_info_feature,
+            query_goalpoint,
+            query_points_score,
+            navi_mask,
+            conditioned_goal_count,
+            candidate_goalpoint.shape[1],
+        )
 
     @staticmethod
     def _repeat_modes_by_goal(tensor, goal_count):
@@ -835,9 +900,7 @@ class TrajectoryHead(nn.Module):
     def forward_train(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets=None,global_img=None,goalpoint=None,points_score=None) -> Dict[str, torch.Tensor]:
         bs = ego_query.shape[0]
         device = ego_query.device
-        goalpoint, points_score = self._prepare_goal_inputs(goalpoint, points_score, bs, device, ego_query.dtype)
-        goal_count = goalpoint.shape[1]
-        goal_info_feature = self._encode_goal_condition(goalpoint, points_score)
+        goalpoint, points_score, has_goalpoint = self._prepare_goal_inputs(goalpoint, points_score, bs, device, ego_query.dtype)
         # 1. add truncated noise to the plan anchor
         plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
         odo_info_fut = self.norm_odo(plan_anchor)
@@ -855,18 +918,22 @@ class TrajectoryHead(nn.Module):
         noisy_traj_points = self.denorm_odo(noisy_traj_points)
 
         modes_per_goal = noisy_traj_points.shape[1]
+        (
+            goal_info_feature,
+            query_goalpoint,
+            query_points_score,
+            navi_mask,
+            conditioned_goal_count,
+            goal_count,
+        ) = self._build_goal_query_inputs(goalpoint, points_score, has_goalpoint, modes_per_goal)
         noisy_traj_points = self._repeat_modes_by_goal(noisy_traj_points, goal_count)
         plan_anchor_for_loss = self._repeat_modes_by_goal(plan_anchor, goal_count)
         global_mode_idx = None
         cls_avg_factor = None
-        if goal_count > 1:
-            global_mode_idx = self._build_global_mode_targets(goalpoint, targets, plan_anchor)
+        if conditioned_goal_count > 0:
+            global_mode_idx = self._build_global_mode_targets(goalpoint[:, :conditioned_goal_count], targets, plan_anchor)
             cls_avg_factor = bs * modes_per_goal
-        query_goalpoint, query_points_score = self._build_per_query_goal_inputs(
-            goalpoint,
-            points_score,
-            modes_per_goal,
-        )
+            
         decoder_points_score = query_points_score if self._config.use_unc_score else 1.0
         ego_fut_mode = noisy_traj_points.shape[1]
         # 2. proj noisy_traj_points to the query
@@ -885,7 +952,7 @@ class TrajectoryHead(nn.Module):
 
         navi_points=query_goalpoint
         # 4. begin the stacked decoder
-        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score)
+        poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score,navi_mask)
 
         trajectory_loss_dict = {}
         ret_traj_loss = 0
@@ -905,9 +972,7 @@ class TrajectoryHead(nn.Module):
         anchor = 20
         num_samples = 64
         device = ego_query.device
-        goalpoint, points_score = self._prepare_goal_inputs(goalpoint, points_score, bs, device, ego_query.dtype)
-        goal_count = goalpoint.shape[1]
-        goal_info_feature = self._encode_goal_condition(goalpoint, points_score)
+        goalpoint, points_score, has_goalpoint = self._prepare_goal_inputs(goalpoint, points_score, bs, device, ego_query.dtype)
         self.diffusion_scheduler.set_timesteps(1000, device)
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
@@ -919,12 +984,15 @@ class TrajectoryHead(nn.Module):
         plan_anchor = plan_anchor.unsqueeze(2).repeat(1,1,num_samples,1,1)
         plan_anchor = plan_anchor.view(bs,num_samples*anchor, 8, 2)
         modes_per_goal = plan_anchor.shape[1]
+        (
+            goal_info_feature,
+            query_goalpoint,
+            query_points_score,
+            navi_mask,
+            _conditioned_goal_count,
+            goal_count,
+        ) = self._build_goal_query_inputs(goalpoint, points_score, has_goalpoint, modes_per_goal)
         plan_anchor = self._repeat_modes_by_goal(plan_anchor, goal_count)
-        query_goalpoint, query_points_score = self._build_per_query_goal_inputs(
-            goalpoint,
-            points_score,
-            modes_per_goal,
-        )
         decoder_points_score = query_points_score if self._config.use_unc_score else 1.0
         img = self.norm_odo(plan_anchor)
         noise = torch.randn(img.shape, device=device)
@@ -960,7 +1028,7 @@ class TrajectoryHead(nn.Module):
 
             # 4. begin the stacked decoder
             navi_points = query_goalpoint
-            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score)
+            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score,navi_mask)
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]

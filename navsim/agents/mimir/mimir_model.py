@@ -113,6 +113,37 @@ def load_navis_from_np(data_dict, token, num_goal_points: int = 1):
     return torch.from_numpy(np.stack(data, axis=0))
 
 
+class RewardConvNet(nn.Module):
+    def __init__(self, input_channels: int, conv1_out_channels: int, conv2_out_channels: int):
+        super(RewardConvNet, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=conv1_out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.bn1 = nn.BatchNorm2d(conv1_out_channels)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(
+            in_channels=conv1_out_channels,
+            out_channels=conv2_out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+        self.bn2 = nn.BatchNorm2d(conv2_out_channels)
+        self.relu2 = nn.ReLU()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu2(x)
+        return self.pool(x)
+
+
 class MimirModel(nn.Module):
     """Torch module for Mimir."""
 
@@ -209,6 +240,14 @@ class MimirModel(nn.Module):
                     f"Received num_poses={config.trajectory_sampling.num_poses} and "
                     f"wm_num_future_frames={self._wm_num_future_frames}."
                 )
+            self._wm_reward_num_future_frames = int(getattr(config, "wm_reward_num_future_frames", 1))
+            self._wm_reward_window_num_poses = config.trajectory_sampling.num_poses - self._wm_reward_num_future_frames + 1
+            if self._wm_reward_window_num_poses <= 0:
+                raise ValueError(
+                    "WM reward sliding-window trajectory length must be positive. "
+                    f"Received num_poses={config.trajectory_sampling.num_poses} and "
+                    f"wm_reward_num_future_frames={self._wm_reward_num_future_frames}."
+                )
             wm_decoder_layer = nn.TransformerDecoderLayer(
                 d_model=config.tf_d_model,
                 nhead=config.wm_num_head,
@@ -225,11 +264,38 @@ class MimirModel(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(config.tf_d_model, config.tf_d_model),
             )
+            if self._wm_reward_window_num_poses == self._wm_window_num_poses:
+                self._wm_reward_action_aware_encoder = self._wm_action_aware_encoder
+            else:
+                wm_reward_action_dim = self._wm_reward_window_num_poses * 2
+                self._wm_reward_action_aware_encoder = nn.Sequential(
+                    nn.Linear(config.tf_d_model + wm_reward_action_dim, config.tf_d_model),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(config.tf_d_model, config.tf_d_model),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(config.tf_d_model, config.tf_d_model),
+                )
             self._wm_bev_feature_head = nn.Sequential(
                 nn.Conv2d(config.tf_d_model, config.bev_features_channels, kernel_size=3, padding=1),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(config.bev_features_channels, config.bev_features_channels, kernel_size=3, padding=1),
                 nn.ReLU(inplace=True),
+            )
+            wm_reward_steps = self._wm_reward_num_future_frames + 1
+            self.reward_conv_net = RewardConvNet(
+                input_channels=config.tf_d_model * wm_reward_steps,
+                conv1_out_channels=config.tf_d_model,
+                conv2_out_channels=config.tf_d_model,
+            )
+            self.reward_cat_head = nn.Sequential(
+                nn.Linear(config.tf_d_model * (wm_reward_steps + 1), config.tf_d_model),
+                nn.ReLU(inplace=True),
+                nn.Linear(config.tf_d_model, config.tf_d_model),
+            )
+            self._wm_reward_head = nn.Sequential(
+                nn.Linear(config.tf_d_model, config.tf_d_model // 2),
+                nn.ReLU(inplace=True),
+                nn.Linear(config.tf_d_model // 2, 1),
             )
 
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None,goalpoint=None,token=None) -> Dict[str, torch.Tensor]:
@@ -317,34 +383,225 @@ class MimirModel(nn.Module):
         agents = self._agent_head(agents_query)
         output.update(agents)
 
-        if self._config.use_wm and targets is not None:
-            if "wm_future_bev_semantic_map" not in targets:
-                target_keys = ", ".join(sorted(targets.keys()))
-                raise RuntimeError(
-                    "use_wm=True requires future BEV semantic map targets, but none were found. "
-                    "Rebuild the cache with the WM future BEV target builder, "
-                    f"and check target keys. Received target keys: {target_keys}"
-                )
+        if self._config.use_wm:
+            self._add_wm_candidate_selection_outputs(output, keyval)
+            self._apply_wm_candidate_selection(output)
 
-            wm_full_trajectory = output["trajectory"]
-            wm_latent = keyval
-            wm_future_bev_semantic_maps = []
+            if targets is not None:
+                if "wm_future_bev_semantic_map" not in targets:
+                    target_keys = ", ".join(sorted(targets.keys()))
+                    raise RuntimeError(
+                        "use_wm=True requires future BEV semantic map targets, but none were found. "
+                        "Rebuild the cache with the WM future BEV target builder, "
+                        f"and check target keys. Received target keys: {target_keys}"
+                    )
 
-            for future_offset in range(1, self._wm_num_future_frames + 1):
-                window_start = future_offset - 1
-                wm_trajectory = self._get_wm_trajectory_window(
-                    trajectory=wm_full_trajectory,
-                    window_start=window_start,
+                wm_training_trajectory = output["trajectory"]
+                if wm_training_trajectory.ndim == 4:
+                    wm_training_trajectory = wm_training_trajectory[:, -1]
+                output["wm_future_bev_semantic_map"] = self._rollout_wm_future_bev_semantic_maps(
+                    initial_latent=keyval,
+                    trajectory=wm_training_trajectory.to(keyval),
                 )
-                wm_latent = self._predict_next_latent(
-                    prev_latent=wm_latent,
-                    prev_trajectory=wm_trajectory,
-                )
-                wm_future_bev_semantic_maps.append(self._decode_wm_bev_semantic_map(wm_latent))
-
-            output["wm_future_bev_semantic_map"] = torch.stack(wm_future_bev_semantic_maps, dim=1)
 
         return output
+
+    def _rollout_wm_future_bev_semantic_maps(
+        self,
+        initial_latent: torch.Tensor,
+        trajectory: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict future ego-frame BEV maps from latent WM rollout."""
+
+        wm_future_latents = self._rollout_wm_future_latents(
+            initial_latent=initial_latent,
+            trajectory=trajectory,
+            num_future_frames=self._wm_num_future_frames,
+            window_num_poses=self._wm_window_num_poses,
+            action_encoder=self._wm_action_aware_encoder,
+        )
+        return self._decode_wm_future_bev_semantic_maps(wm_future_latents)
+
+    def _rollout_wm_future_latents(
+        self,
+        initial_latent: torch.Tensor,
+        trajectory: torch.Tensor,
+        num_future_frames: int,
+        window_num_poses: int,
+        action_encoder: nn.Module,
+    ) -> torch.Tensor:
+        """Roll out future latent scene tokens conditioned by a candidate trajectory."""
+
+        wm_latent = initial_latent
+        wm_future_latents = []
+
+        for future_offset in range(1, num_future_frames + 1):
+            window_start = future_offset - 1
+            wm_trajectory = self._get_wm_trajectory_window(
+                trajectory=trajectory,
+                window_start=window_start,
+                window_num_poses=window_num_poses,
+            )
+            wm_latent = self._predict_next_latent(
+                prev_latent=wm_latent,
+                prev_trajectory=wm_trajectory,
+                action_encoder=action_encoder,
+            )
+            wm_future_latents.append(wm_latent)
+
+        return torch.stack(wm_future_latents, dim=1)
+
+    def _decode_wm_future_bev_semantic_maps(self, wm_future_latents: torch.Tensor) -> torch.Tensor:
+        batch_size, num_future_frames, num_tokens, channels = wm_future_latents.shape
+        flat_latents = wm_future_latents.reshape(batch_size * num_future_frames, num_tokens, channels)
+        flat_maps = self._decode_wm_bev_semantic_map(flat_latents)
+        return flat_maps.view(
+            batch_size,
+            num_future_frames,
+            flat_maps.shape[1],
+            flat_maps.shape[2],
+            flat_maps.shape[3],
+        )
+
+    def _add_wm_candidate_selection_outputs(
+        self,
+        output: Dict[str, torch.Tensor],
+        keyval: torch.Tensor,
+    ) -> None:
+        """Score all trajectory candidates with a WoTE-style WM reward head."""
+
+        candidate_trajectories = output.get("candidate_trajectories")
+        candidate_logits = output.get("candidate_logits")
+        if candidate_trajectories is None or candidate_logits is None:
+            return
+
+        batch_size, num_candidates = candidate_logits.shape
+        if num_candidates <= 0:
+            return
+
+        candidate_indices = torch.arange(
+            num_candidates,
+            device=candidate_logits.device,
+        )[None].expand(batch_size, -1)
+        max_wm_candidates = self._get_wm_candidate_selection_count(output, num_candidates)
+        if max_wm_candidates < num_candidates:
+            candidate_topk_indices = candidate_logits.topk(max_wm_candidates, dim=1).indices
+            trajectory_gather_index = candidate_topk_indices[:, :, None, None].expand(
+                -1,
+                -1,
+                candidate_trajectories.shape[2],
+                candidate_trajectories.shape[3],
+            )
+            candidate_trajectories = torch.gather(
+                candidate_trajectories,
+                dim=1,
+                index=trajectory_gather_index,
+            )
+            candidate_logits = torch.gather(candidate_logits, dim=1, index=candidate_topk_indices)
+            candidate_indices = torch.gather(candidate_indices, dim=1, index=candidate_topk_indices)
+            num_candidates = max_wm_candidates
+
+        flat_keyval = keyval[:, None].expand(-1, num_candidates, -1, -1).reshape(
+            batch_size * num_candidates,
+            keyval.shape[1],
+            keyval.shape[2],
+        )
+        flat_trajectories = candidate_trajectories.reshape(
+            batch_size * num_candidates,
+            candidate_trajectories.shape[2],
+            candidate_trajectories.shape[3],
+        )
+        candidate_latents = self._rollout_wm_future_latents(
+            initial_latent=flat_keyval,
+            trajectory=flat_trajectories,
+            num_future_frames=self._wm_reward_num_future_frames,
+            window_num_poses=self._wm_reward_window_num_poses,
+            action_encoder=self._wm_reward_action_aware_encoder,
+        )
+        reward_feature = self._compute_wm_reward_feature(flat_keyval, candidate_latents)
+        wm_candidate_logits = self._wm_reward_head(reward_feature).view(batch_size, num_candidates)
+
+        output["wm_candidate_logits"] = wm_candidate_logits
+        output["wm_candidate_base_logits"] = candidate_logits
+        output["wm_candidate_indices"] = candidate_indices
+        output["wm_candidate_trajectories"] = candidate_trajectories
+
+    def _get_wm_candidate_selection_count(
+        self,
+        output: Dict[str, torch.Tensor],
+        num_candidates: int,
+    ) -> int:
+        """Use the training-time candidate count as the max number of WM-scored candidates."""
+
+        anchor_count = int(self._trajectory_head.plan_anchor.shape[0])
+        if anchor_count <= 0:
+            return num_candidates
+
+        anchor_trajectories = output.get("anchor_trajectories")
+        if anchor_trajectories is not None:
+            goal_count = anchor_trajectories.shape[1] if anchor_trajectories.ndim == 6 else 1
+        else:
+            goal_count = max(1, num_candidates // anchor_count)
+
+        return min(num_candidates, anchor_count * goal_count)
+
+    def _compute_wm_reward_feature(
+        self,
+        initial_latent: torch.Tensor,
+        wm_future_latents: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build WoTE-style reward features from current and predicted future latents."""
+
+        all_latents = torch.cat([initial_latent[:, None], wm_future_latents], dim=1)
+        batch_size, num_steps, num_tokens, channels = all_latents.shape
+
+        bev_tokens = all_latents[:, :, :-1]
+        bev_side = int(np.sqrt(bev_tokens.shape[2]))
+        if bev_side * bev_side != bev_tokens.shape[2]:
+            raise ValueError(f"Expected square BEV tokens, got {bev_tokens.shape[2]} tokens.")
+
+        bev_feat_list = []
+        for step_idx in range(num_steps):
+            bev_feat = bev_tokens[:, step_idx].contiguous().view(batch_size, bev_side, bev_side, channels)
+            bev_feat_list.append(bev_feat)
+        all_bev_feature = torch.cat(bev_feat_list, dim=-1).permute(0, 3, 1, 2)
+        reward_conv_output = self.reward_conv_net(all_bev_feature).squeeze(-1).permute(0, 2, 1)
+
+        ego_feat_list = [all_latents[:, step_idx, -1:] for step_idx in range(num_steps)]
+        cat_reward_feature = torch.cat(ego_feat_list + [reward_conv_output], dim=1)
+        cat_reward_feature = cat_reward_feature.reshape(batch_size, -1)
+        return self.reward_cat_head(cat_reward_feature)
+
+    def _apply_wm_candidate_selection(self, output: Dict[str, torch.Tensor]) -> None:
+        candidate_trajectories = output.get("wm_candidate_trajectories")
+        wm_candidate_logits = output.get("wm_candidate_logits")
+        base_logits = output.get("wm_candidate_base_logits")
+        if candidate_trajectories is None or wm_candidate_logits is None or base_logits is None:
+            return
+
+        base_weight = float(getattr(self._config, "wm_base_logit_weight", 1.0))
+        wm_weight = float(getattr(self._config, "wm_inference_score_weight", 1.0))
+        base_scores = F.log_softmax(base_logits, dim=1)
+        wm_scores = F.log_softmax(wm_candidate_logits, dim=1)
+        final_scores = base_weight * base_scores + wm_weight * wm_scores
+        best_index = final_scores.argmax(dim=1)
+        gather_index = best_index[:, None, None, None].expand(
+            -1,
+            1,
+            candidate_trajectories.shape[2],
+            candidate_trajectories.shape[3],
+        )
+        output["trajectory"] = torch.gather(candidate_trajectories, dim=1, index=gather_index).squeeze(1)
+        output["wm_candidate_base_scores"] = base_scores
+        output["wm_candidate_scores"] = wm_scores
+        output["wm_candidate_final_scores"] = final_scores
+        output["wm_candidate_selected_index"] = best_index
+        if "wm_candidate_indices" in output:
+            output["wm_candidate_selected_candidate_index"] = torch.gather(
+                output["wm_candidate_indices"],
+                dim=1,
+                index=best_index[:, None],
+            ).squeeze(1)
 
     def _decode_wm_bev_semantic_map(self, wm_latent: torch.Tensor) -> torch.Tensor:
         """Decode predicted WM latent tokens into a future ego-frame BEV semantic map."""
@@ -372,23 +629,140 @@ class MimirModel(nn.Module):
         self,
         prev_latent: torch.Tensor,
         prev_trajectory: torch.Tensor,
+        action_encoder: nn.Module,
     ) -> torch.Tensor:
-        """Predict next ego-frame latent tokens from the previous latent and ego action."""
-        batch_size, num_tokens, _ = prev_latent.shape
-        prev_waypoints = prev_trajectory[..., :2].reshape(batch_size, 1, -1)
-        prev_waypoints = prev_waypoints.repeat(1, num_tokens, 1)
-        action_aware_latent = self._wm_action_aware_encoder(
-            torch.cat([prev_latent, prev_waypoints], dim=-1)
+        """Predict next ego-frame latent tokens after injecting ego/trajectory feature into BEV tokens."""
+        ego_trajectory_latent = self._encode_wm_ego_trajectory_feature(
+            prev_latent=prev_latent,
+            prev_trajectory=prev_trajectory,
+            action_encoder=action_encoder,
         )
-        return self._wm_decoder(action_aware_latent, action_aware_latent)
+        trajectory_conditioned_latent = self._inject_wm_ego_trajectory_feature(
+            prev_latent=prev_latent,
+            ego_trajectory_latent=ego_trajectory_latent,
+            prev_trajectory=prev_trajectory,
+        )
+        return self._wm_decoder(trajectory_conditioned_latent, trajectory_conditioned_latent)
+
+    @staticmethod
+    def _encode_wm_ego_trajectory_feature(
+        prev_latent: torch.Tensor,
+        prev_trajectory: torch.Tensor,
+        action_encoder: nn.Module,
+    ) -> torch.Tensor:
+        batch_size = prev_latent.shape[0]
+        prev_ego_latent = prev_latent[:, -1]
+        prev_waypoints = prev_trajectory[..., :2].reshape(batch_size, -1)
+        return action_encoder(torch.cat([prev_ego_latent, prev_waypoints], dim=-1))
+
+    def _inject_wm_ego_trajectory_feature(
+        self,
+        prev_latent: torch.Tensor,
+        ego_trajectory_latent: torch.Tensor,
+        prev_trajectory: torch.Tensor,
+    ) -> torch.Tensor:
+        bev_tokens = prev_latent[:, :-1]
+        batch_size, num_bev_tokens, channels = bev_tokens.shape
+        bev_side = int(np.sqrt(num_bev_tokens))
+        if bev_side * bev_side != num_bev_tokens:
+            raise ValueError(f"Expected square BEV tokens, got {num_bev_tokens} tokens.")
+
+        endpoint = prev_trajectory[:, -1]
+        bev_map = bev_tokens.permute(0, 2, 1).reshape(batch_size, channels, bev_side, bev_side)
+        bev_map = self.inject_ego_feat_to_bev_map(
+            bev_map=bev_map,
+            new_features=ego_trajectory_latent,
+            delta_x_y=endpoint[..., :2],
+            H=bev_side,
+            W=bev_side,
+        )
+        injected_bev_tokens = bev_map.permute(0, 2, 3, 1).reshape(batch_size, num_bev_tokens, channels)
+        return torch.cat([injected_bev_tokens, ego_trajectory_latent[:, None]], dim=1)
+
+    @staticmethod
+    def inject_ego_feat_to_bev_map(
+        bev_map: torch.Tensor,
+        new_features: torch.Tensor,
+        delta_x_y: torch.Tensor,
+        H: int = 8,
+        W: int = 8,
+    ) -> torch.Tensor:
+        batch_size, channels, height, width = bev_map.shape
+        if height != H or width != W:
+            raise ValueError(f"BEV map dimensions must be ({H}, {W}), but got ({height}, {width}).")
+        if new_features.shape != (batch_size, channels):
+            raise ValueError(f"new_features must have shape ({batch_size}, {channels}), got {new_features.shape}.")
+
+        delta_x, delta_y = delta_x_y[:, 0], delta_x_y[:, 1]
+        pixel_per_meter_x = H / 32.0
+        pixel_per_meter_y = W / 64.0
+
+        h_idx = delta_x * pixel_per_meter_x
+        w_idx = delta_y * pixel_per_meter_y + (W / 2.0)
+
+        h0 = torch.floor(h_idx).long()
+        w0 = torch.floor(w_idx).long()
+        h1 = h0 + 1
+        w1 = w0 + 1
+
+        dh = h_idx - h0.float()
+        dw = w_idx - w0.float()
+        weights = torch.stack(
+            [
+                (1 - dh) * (1 - dw),
+                (1 - dh) * dw,
+                dh * (1 - dw),
+                dh * dw,
+            ],
+            dim=1,
+        )
+        h_indices = torch.stack([h0, h0, h1, h1], dim=1)
+        w_indices = torch.stack([w0, w1, w0, w1], dim=1)
+        batch_indices = torch.arange(batch_size, device=bev_map.device).view(batch_size, 1).repeat(1, 4)
+
+        h_indices_flat = h_indices.reshape(-1)
+        w_indices_flat = w_indices.reshape(-1)
+        weights_flat = weights.reshape(-1)
+        batch_indices_flat = batch_indices.reshape(-1)
+
+        valid = (
+            (h_indices_flat >= 0)
+            & (h_indices_flat < H)
+            & (w_indices_flat >= 0)
+            & (w_indices_flat < W)
+        )
+        if not valid.any():
+            return bev_map
+
+        h_indices_valid = h_indices_flat[valid]
+        w_indices_valid = w_indices_flat[valid]
+        weights_valid = weights_flat[valid].to(dtype=new_features.dtype).unsqueeze(1)
+        batch_indices_valid = batch_indices_flat[valid]
+
+        weighted_features = (new_features[batch_indices_valid] * weights_valid).to(dtype=bev_map.dtype)
+        channel_indices = torch.arange(channels, device=bev_map.device).view(1, channels).repeat(
+            weighted_features.shape[0],
+            1,
+        )
+        linear_indices = (
+            batch_indices_valid.unsqueeze(1) * channels * H * W
+            + channel_indices * H * W
+            + h_indices_valid.unsqueeze(1) * W
+            + w_indices_valid.unsqueeze(1)
+        ).reshape(-1)
+
+        bev_map_flat = bev_map.reshape(-1).clone()
+        bev_map_flat.index_add_(0, linear_indices, weighted_features.reshape(-1))
+        return bev_map_flat.view(batch_size, channels, H, W)
 
     def _get_wm_trajectory_window(
         self,
         trajectory: torch.Tensor,
         window_start: int,
+        window_num_poses: int,
     ) -> torch.Tensor:
         """Take a path slice and express it in the previous predicted ego frame."""
-        window_end = window_start + self._wm_window_num_poses
+        window_end = window_start + window_num_poses
         if window_end > trajectory.shape[1]:
             raise ValueError(
                 f"WM trajectory window [{window_start}, {window_end}) exceeds predicted path length "
@@ -897,7 +1271,13 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls_list[-1].argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg_list[-1], 1, mode_idx).squeeze(1)
-        return {"trajectory": best_reg,"trajectory_loss":ret_traj_loss,"trajectory_loss_dict":trajectory_loss_dict}
+        return {
+            "trajectory": best_reg,
+            "candidate_trajectories": poses_reg_list[-1],
+            "candidate_logits": poses_cls_list[-1],
+            "trajectory_loss": ret_traj_loss,
+            "trajectory_loss_dict": trajectory_loss_dict,
+        }
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,goalpoint=None,points_score=1.0) -> Dict[str, torch.Tensor]:
         step_num = 2
@@ -973,11 +1353,15 @@ class TrajectoryHead(nn.Module):
         mode_idx = poses_cls.argmax(dim=-1)
         mode_idx = mode_idx[...,None,None,None].repeat(1,1,self._num_poses,3)
         best_reg = torch.gather(poses_reg, 1, mode_idx).squeeze(1)
+        candidate_trajectories = poses_reg
+        candidate_logits = poses_cls
         if goal_count == 1:
             poses_reg = poses_reg.view(bs, anchor, num_samples, self._num_poses, 3)
         else:
             poses_reg = poses_reg.view(bs, goal_count, anchor, num_samples, self._num_poses, 3)
                 
         return {"trajectory": best_reg,
+                "candidate_trajectories": candidate_trajectories,
+                "candidate_logits": candidate_logits,
                 'anchor_trajectories': poses_reg
                 }

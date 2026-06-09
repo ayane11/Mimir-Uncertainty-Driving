@@ -37,10 +37,15 @@ def mimir_loss(
         wm_loss = _world_model_future_bev_semantic_loss(targets, predictions)
     else:
         wm_loss = 0.0
+    if "wm_candidate_logits" in predictions and "wm_candidate_trajectories" in predictions:
+        wm_reward_loss = _world_model_candidate_reward_loss(targets, predictions, config)
+    else:
+        wm_reward_loss = 0.0
     loss = (
         config.trajectory_weight * trajectory_loss
         + config.diff_loss_weight * diffusion_loss
         + config.wm_loss_weight * wm_loss
+        + config.wm_reward_loss_weight * wm_reward_loss
         + config.agent_class_weight * agent_class_loss
         + config.agent_box_weight * agent_box_loss
         + config.bev_semantic_weight * bev_semantic_loss
@@ -50,6 +55,7 @@ def mimir_loss(
         'trajectory_loss': config.trajectory_weight*trajectory_loss,
         'diffusion_loss': config.diff_loss_weight*diffusion_loss,
         'wm_loss': config.wm_loss_weight*wm_loss,
+        'wm_reward_loss': config.wm_reward_loss_weight*wm_reward_loss,
         'agent_class_loss': config.agent_class_weight*agent_class_loss,
         'agent_box_loss': config.agent_box_weight*agent_box_loss,
         'bev_semantic_loss': config.bev_semantic_weight*bev_semantic_loss
@@ -75,9 +81,50 @@ def _world_model_future_bev_semantic_loss(
         target_maps = target_maps[:, None]
 
     batch_size, num_future_frames, num_classes, height, width = pred_maps.shape
+    if target_maps.shape[1] != num_future_frames:
+        raise RuntimeError(
+            "WM future BEV target frame count does not match predictions. "
+            f"Predicted {num_future_frames} frame(s), but target has {target_maps.shape[1]}. "
+            "Set wm_num_future_frames to match the cached wm_future_bev_semantic_map frames."
+        )
     pred_maps = pred_maps.reshape(batch_size * num_future_frames, num_classes, height, width)
     target_maps = target_maps.reshape(batch_size * num_future_frames, height, width)
     return F.cross_entropy(pred_maps, target_maps)
+
+
+def _world_model_candidate_reward_loss(
+    targets: Dict[str, torch.Tensor],
+    predictions: Dict[str, torch.Tensor],
+    config: MimirConfig,
+) -> torch.Tensor:
+    """Train WM candidate logits to prefer trajectories close to the GT path."""
+
+    candidate_trajectories = predictions["wm_candidate_trajectories"]
+    candidate_logits = predictions["wm_candidate_logits"]
+    if candidate_logits.shape[1] <= 1:
+        return candidate_logits.new_tensor(0.0)
+
+    target_trajectory = targets["trajectory"].float()
+    if target_trajectory.ndim == 4:
+        target_trajectory = target_trajectory[:, -1]
+    target_trajectory = target_trajectory.to(candidate_trajectories)
+
+    num_poses = min(candidate_trajectories.shape[2], target_trajectory.shape[1])
+    state_dim = min(candidate_trajectories.shape[3], target_trajectory.shape[2])
+    candidate_flat = candidate_trajectories[:, :, :num_poses, :state_dim].reshape(
+        candidate_trajectories.shape[0],
+        candidate_trajectories.shape[1],
+        -1,
+    )
+    target_flat = target_trajectory[:, :num_poses, :state_dim].reshape(
+        target_trajectory.shape[0],
+        -1,
+    )
+
+    distances = torch.cdist(candidate_flat, target_flat[:, None], p=2).squeeze(-1)
+    target_probs = F.softmax(-distances.detach(), dim=-1)
+    log_probs = F.log_softmax(candidate_logits, dim=-1)
+    return -(target_probs * log_probs).sum(dim=-1).mean()
 
 
 def _agent_loss(

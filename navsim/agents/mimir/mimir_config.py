@@ -96,7 +96,11 @@ class MimirConfig:
     diff_loss_weight: float = 20.0
     use_wm: bool = False
     wm_loss_weight: float = 6.0
+    wm_reward_loss_weight: float = 2.0
+    wm_base_logit_weight: float = 1.0
+    wm_inference_score_weight: float = 0.5
     wm_num_future_frames: int = 3
+    wm_reward_num_future_frames: int = 1
     wm_num_layers: int = 1
     wm_num_head: int = 8
     wm_d_ffn: int = 512

@@ -39,6 +39,11 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         log_names: Optional[List[str]] = None,
         metric_cache_path: Optional[str] = None,
         metric_cache_scenario_type: str = "unknown",
+        is_training: bool = True,
+        use_beyonddrive: bool = False,
+        negative_samples_path: Optional[str] = None,
+        negative_sample_score_threshold: float = 0.6,
+        negative_sample_submetric_index: int = -1,
     ):
         """
         Initializes the dataset module.
@@ -60,6 +65,14 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
         self._target_builders = target_builders
         self._metric_cache_path = Path(metric_cache_path) if metric_cache_path else None
         self._metric_cache_scenario_type = metric_cache_scenario_type
+        self.is_training = is_training
+        self.use_beyonddrive = use_beyonddrive
+        self.negative_samples_path = Path(negative_samples_path) if negative_samples_path else None
+        self.negative_sample_score_threshold = negative_sample_score_threshold
+        self.submetric_index = int(os.environ.get("SUBMETRIC_INDEX", str(negative_sample_submetric_index)))
+        if self.is_training and self.use_beyonddrive:
+            assert self.negative_samples_path is not None, "negative_samples_path is required for BeyondDrive training."
+            assert self.negative_samples_path.is_dir(), f"Negative sample path {self.negative_samples_path} does not exist!"
         self._valid_cache_paths: Dict[str, Path] = self._load_valid_caches(
             cache_path=self._cache_path,
             feature_builders=self._feature_builders,
@@ -131,6 +144,27 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
 
         return token_path / "metric_cache.pkl"
 
+    def _load_negative_trajectory(self, token: str, human_trajectory: torch.Tensor) -> torch.Tensor:
+        negative_sample_file = self.negative_samples_path / f"{token}.pkl"
+        with open(negative_sample_file, "rb") as f:
+            token_trajs_pdms = pickle.load(f)
+
+        pred_trajectorys = token_trajs_pdms.get("pred_trajectorys")
+        if pred_trajectorys is None:
+            pred_trajectorys = token_trajs_pdms.get("pred_trajectorys_array")
+        if pred_trajectorys is None:
+            raise KeyError(f"Negative sample file {negative_sample_file} has no pred_trajectorys field.")
+
+        pdm_score_matrix = token_trajs_pdms["pdm_score_matrix"]
+        valid_index = pdm_score_matrix[:, self.submetric_index] < self.negative_sample_score_threshold
+        pred_trajectorys = pred_trajectorys[valid_index]
+        if pred_trajectorys.shape[0] == 0:
+            return human_trajectory * 0
+
+        pred_trajectorys = torch.as_tensor(pred_trajectorys, dtype=torch.float32)
+        min_index = torch.argmin((pred_trajectorys - human_trajectory[None]).pow(2).sum(dim=-1).mean(dim=-1))
+        return pred_trajectorys[min_index]
+
     def _load_scene_with_token(
         self,
         token: str,
@@ -158,6 +192,9 @@ class CacheOnlyDataset(torch.utils.data.Dataset):
             data_dict_path = token_path / (builder.get_unique_name() + ".gz")
             data_dict = load_feature_target_from_pickle(data_dict_path)
             targets.update(data_dict)
+
+        if self.is_training and self.use_beyonddrive:
+            targets["negative_trajectory"] = self._load_negative_trajectory(token, targets["trajectory"])
 
         if self._metric_cache_path is not None:
             return (features, targets, str(self._get_metric_cache_path(token_path, token)), token)

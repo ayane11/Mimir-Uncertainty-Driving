@@ -105,6 +105,7 @@ def main(cfg: DictConfig) -> None:
         assert (
             cfg.cache_path is not None
         ), "cache_path must be provided when using cached data without building SceneLoader"
+        agent_config = getattr(agent, "_config", None)
         train_data = CacheOnlyDataset(
             cache_path=cfg.cache_path,
             feature_builders=agent.get_feature_builders(),
@@ -112,6 +113,11 @@ def main(cfg: DictConfig) -> None:
             log_names=cfg.train_logs,
             metric_cache_path=cfg.get("train_metric_cache_path", None),
             metric_cache_scenario_type=cfg.get("train_metric_cache_scenario_type", "unknown"),
+            is_training=True,
+            use_beyonddrive=getattr(agent_config, "use_beyonddrive", False),
+            negative_samples_path=cfg.get("negative_samples_path", None),
+            negative_sample_score_threshold=getattr(agent_config, "negative_sample_score_threshold", 0.6),
+            negative_sample_submetric_index=getattr(agent_config, "negative_sample_submetric_index", -1),
         )
         val_data = CacheOnlyDataset(
             cache_path=cfg.cache_path,
@@ -120,6 +126,7 @@ def main(cfg: DictConfig) -> None:
             log_names=cfg.val_logs,
             metric_cache_path=cfg.get("train_metric_cache_path", None),
             metric_cache_scenario_type=cfg.get("train_metric_cache_scenario_type", "unknown"),
+            is_training=False,
         )
     else:
         logger.info("Building SceneLoader")

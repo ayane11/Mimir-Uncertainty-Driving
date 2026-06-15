@@ -94,6 +94,10 @@ class MimirConfig:
     trajectory_cls_weight: float = 10.0
     trajectory_reg_weight: float = 8.0
     diff_loss_weight: float = 20.0
+    use_beyonddrive: bool = False
+    rde_loss_weight: float = 5.0
+    negative_sample_score_threshold: float = 0.6
+    negative_sample_submetric_index: int = -1
     use_wm: bool = False
     wm_loss_weight: float = 6.0
     wm_reward_loss_weight: float = 2.0

@@ -132,7 +132,7 @@ class LossComputer(nn.Module):
         # print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
         # print(targets)
         # import pdb;pdb.set_trace()
-        target_traj = targets["trajectory"]
+        target_traj = targets["trajectory"].to(poses_reg)
         if mode_idx is None:
             dist = torch.linalg.norm(target_traj.unsqueeze(1)[...,:2] - plan_anchor, dim=-1)
             dist = dist.mean(dim=-1)
@@ -161,6 +161,13 @@ class LossComputer(nn.Module):
 
         # Calculate regression loss
         reg_loss = self.reg_loss_weight * F.l1_loss(best_reg, target_traj)
+        if getattr(self._config, "use_beyonddrive", False) and "negative_trajectory" in targets:
+            negative_trajectory = targets["negative_trajectory"].to(best_reg)
+            negative_index = negative_trajectory.sum(-1).sum(-1) > 0
+            if negative_index.any():
+                rde_loss = (best_reg - negative_trajectory).abs().mean(-1).mean(-1)
+                rde_loss = rde_loss[negative_index].mean()
+                reg_loss = reg_loss - float(getattr(self._config, "rde_loss_weight", 5.0)) * rde_loss
         # import ipdb; ipdb.set_trace()
         # Combine classification and regression losses
         ret_loss = loss_cls + reg_loss

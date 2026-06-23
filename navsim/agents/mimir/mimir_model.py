@@ -1180,6 +1180,53 @@ class TrajectoryHead(nn.Module):
         anchor_idx = torch.argmin(anchor_dist, dim=-1)
         return goal_idx * plan_anchor.shape[1] + anchor_idx
 
+    def _build_goal_uncertainty_negative_targets(self, targets, goalpoint, points_score):
+        if targets is None:
+            return targets, None
+        if not getattr(self._config, "use_beyonddrive", False):
+            return targets, None
+        if not getattr(self._config, "use_goal_unc_negative_coupling", False):
+            return targets, None
+        if "negative_trajectory" not in targets:
+            return targets, None
+        if goalpoint is None or points_score is None:
+            return targets, None
+
+        coupling_weight = float(getattr(self._config, "goal_unc_negative_coupling_weight", 0.0))
+        if coupling_weight <= 0:
+            return targets, None
+
+        negative_trajectory = targets["negative_trajectory"].to(goalpoint)
+        negative_index = negative_trajectory.sum(-1).sum(-1) > 0
+        if not negative_index.any():
+            return targets, None
+
+        negative_endpoint = negative_trajectory[:, -1, :2]
+        goal_distance = torch.linalg.norm(goalpoint - negative_endpoint[:, None], dim=-1)
+        negative_goal_idx = torch.argmin(goal_distance, dim=-1)
+
+        goal_uncertainty = points_score.abs().mean(dim=-1)
+        selected_uncertainty = torch.gather(
+            goal_uncertainty,
+            dim=1,
+            index=negative_goal_idx[:, None],
+        ).squeeze(1)
+
+        if goal_uncertainty.shape[1] > 1:
+            uncertainty_center = goal_uncertainty.mean(dim=1)
+            uncertainty_scale = goal_uncertainty.std(dim=1, unbiased=False).clamp_min(1e-4)
+            relative_uncertainty = ((selected_uncertainty - uncertainty_center) / uncertainty_scale).clamp(-1.0, 1.0)
+        else:
+            relative_uncertainty = torch.zeros_like(selected_uncertainty)
+
+        negative_weight = 1.0 + coupling_weight * relative_uncertainty
+        negative_weight = negative_weight.clamp(1.0 - coupling_weight, 1.0 + coupling_weight)
+        negative_weight = torch.where(negative_index, negative_weight, torch.ones_like(negative_weight))
+
+        loss_targets = dict(targets)
+        loss_targets["negative_goal_uncertainty_weight"] = negative_weight.detach()
+        return loss_targets, negative_weight
+
     def norm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
@@ -1242,6 +1289,11 @@ class TrajectoryHead(nn.Module):
             modes_per_goal,
         )
         decoder_points_score = query_points_score if self._config.use_unc_score else 1.0
+        loss_targets, negative_goal_uncertainty_weight = self._build_goal_uncertainty_negative_targets(
+            targets,
+            goalpoint,
+            points_score,
+        )
         ego_fut_mode = noisy_traj_points.shape[1]
         # 2. proj noisy_traj_points to the query
         traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
@@ -1262,9 +1314,11 @@ class TrajectoryHead(nn.Module):
         poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score)
 
         trajectory_loss_dict = {}
+        if negative_goal_uncertainty_weight is not None:
+            trajectory_loss_dict["negative_goal_uncertainty_weight"] = negative_goal_uncertainty_weight.mean().detach()
         ret_traj_loss = 0
         for idx, (poses_reg, poses_cls) in enumerate(zip(poses_reg_list, poses_cls_list)):
-            trajectory_loss = self.loss_computer(poses_reg, poses_cls, targets, plan_anchor_for_loss, mode_idx=global_mode_idx, cls_avg_factor=cls_avg_factor)
+            trajectory_loss = self.loss_computer(poses_reg, poses_cls, loss_targets, plan_anchor_for_loss, mode_idx=global_mode_idx, cls_avg_factor=cls_avg_factor)
             trajectory_loss_dict[f"trajectory_loss_{idx}"] = trajectory_loss
             ret_traj_loss += trajectory_loss
 

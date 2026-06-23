@@ -166,6 +166,9 @@ class LossComputer(nn.Module):
             negative_index = negative_trajectory.sum(-1).sum(-1) > 0
             if negative_index.any():
                 rde_loss = (best_reg - negative_trajectory).abs().mean(-1).mean(-1)
+                if "negative_goal_uncertainty_weight" in targets:
+                    negative_goal_uncertainty_weight = targets["negative_goal_uncertainty_weight"].to(rde_loss)
+                    rde_loss = rde_loss * negative_goal_uncertainty_weight.view_as(rde_loss)
                 rde_loss = rde_loss[negative_index].mean()
                 reg_loss = reg_loss - float(getattr(self._config, "rde_loss_weight", 5.0)) * rde_loss
         # import ipdb; ipdb.set_trace()

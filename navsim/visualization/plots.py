@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 import io
 
 from tqdm import tqdm
@@ -8,7 +8,12 @@ import matplotlib.pyplot as plt
 from navsim.agents.abstract_agent import AbstractAgent
 from navsim.common.dataclasses import Scene
 from navsim.visualization.config import BEV_PLOT_CONFIG, TRAJECTORY_CONFIG, CAMERAS_PLOT_CONFIG
-from navsim.visualization.bev import add_configured_bev_on_ax, add_trajectory_to_bev_ax
+from navsim.visualization.bev import (
+    ArrayBank,
+    add_configured_bev_on_ax,
+    add_navi_bank_to_bev_ax,
+    add_trajectory_to_bev_ax,
+)
 from navsim.visualization.camera import add_annotations_to_camera_ax, add_lidar_to_camera_ax, add_camera_ax
 
 
@@ -89,6 +94,55 @@ def plot_bev_with_agent(scene: Scene, agent: AbstractAgent) -> Tuple[plt.Figure,
     add_trajectory_to_bev_ax(ax, agent_trajectory, TRAJECTORY_CONFIG["agent"])
     configure_bev_ax(ax)
     configure_ax(ax)
+
+    return fig, ax
+
+
+def plot_bev_with_navi_uncertainty(
+    scene: Scene,
+    navi_bank: ArrayBank,
+    unc_bank: Optional[ArrayBank] = None,
+    token: Optional[str] = None,
+    frame_idx: Optional[int] = None,
+    num_goal_points: Optional[int] = 3,
+    add_gt_trajectory: bool = True,
+    show_colorbar: bool = True,
+    labels: bool = True,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a BEV scene with token-specific navigation goals and uncertainty.
+    :param scene: navsim scene dataclass
+    :param navi_bank: path or loaded dict mapping token -> goal array
+    :param unc_bank: optional path or loaded dict mapping token -> uncertainty array
+    :param token: scene token; defaults to scene.scene_metadata.initial_token
+    :param frame_idx: frame index; defaults to current frame
+    :param num_goal_points: max number of goals to visualize
+    :param add_gt_trajectory: whether to draw the expert future trajectory
+    :param show_colorbar: whether to show uncertainty colorbar
+    :param labels: whether to annotate goals
+    :return: figure and axis
+    """
+    if token is None:
+        token = scene.scene_metadata.initial_token
+    if frame_idx is None:
+        frame_idx = scene.scene_metadata.num_history_frames - 1
+
+    fig, ax = plt.subplots(1, 1, figsize=BEV_PLOT_CONFIG["figure_size"])
+    add_configured_bev_on_ax(ax, scene.map_api, scene.frames[frame_idx])
+    if add_gt_trajectory:
+        add_trajectory_to_bev_ax(ax, scene.get_future_trajectory(), TRAJECTORY_CONFIG["human"])
+    add_navi_bank_to_bev_ax(
+        ax,
+        navi_bank=navi_bank,
+        token=token,
+        unc_bank=unc_bank,
+        num_goal_points=num_goal_points,
+        show_colorbar=show_colorbar,
+        labels=labels,
+    )
+    configure_bev_ax(ax)
+    configure_ax(ax)
+    fig.tight_layout()
 
     return fig, ax
 

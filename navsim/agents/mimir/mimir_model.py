@@ -302,7 +302,10 @@ class MimirModel(nn.Module):
         """Torch module forward pass."""
 
         camera_feature: torch.Tensor = features["camera_feature"]
-        lidar_feature: torch.Tensor = features["lidar_feature"]
+        if self._config.latent:
+            lidar_feature = None
+        else:
+            lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
         if self._config.status_norm and self._config.training==False:
             vle = torch.norm(status_feature[:,4:6],dim=-1,keepdim=True)

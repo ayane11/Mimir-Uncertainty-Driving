@@ -13,7 +13,7 @@ export OPENBLAS_CORETYPE=Haswell
 # ============================================ training for unc ====================================================
 CACHE_PATH='/data/openscene/cache/mimir_feature_cache'
 TRAIN_METRIC_CACHE_PATH='/data/openscene/cache/navtrain_metric_cache'
-CHECKPOINT_PATH='/home/navsim/exp/a_navtrain_mimir_agent_traj/mimir_wm/lightning_logs/version_0/checkpoints/epoch\=99-step\=133000.ckpt'
+CHECKPOINT_PATH='/home/navsim/exp/a_navtrain_mimir_agent_traj/mimir_final_90.0/lightning_logs/version_0/checkpoints/best-epoch\=96.ckpt'
 COORD_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/navi_dict.npy'
 UNC_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/unc_dict.npy'
 
@@ -29,6 +29,7 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     +train_metric_cache_path=$TRAIN_METRIC_CACHE_PATH \
     dataloader.params.batch_size=64 \
     trainer.params.max_epochs=10 \
+    trainer.params.strategy=ddp_find_unused_parameters_true \
     force_cache_computation=False \
     agent.checkpoint_path=$CHECKPOINT_PATH \
     agent.config.latent=False \

@@ -29,6 +29,7 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     +train_metric_cache_path=$TRAIN_METRIC_CACHE_PATH \
     dataloader.params.batch_size=64 \
     trainer.params.max_epochs=20 \
+    trainer.params.strategy=ddp_find_unused_parameters_true \
     force_cache_computation=False \
     agent.checkpoint_path=$CHECKPOINT_PATH \
     agent.config.latent=False \

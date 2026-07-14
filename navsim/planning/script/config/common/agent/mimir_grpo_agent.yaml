@@ -29,5 +29,5 @@ config:
   goal_coord_path: null
   navi_unc_outputdir: null
 checkpoint_path: null
-lr: 2.5e-5
+lr: 1e-5
 traj_save_path: null

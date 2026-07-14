@@ -20,9 +20,19 @@ from torch.distributions import Normal
 from typing import Any, List, Dict, Optional, Union,Tuple
 import numpy.typing as npt
 from navsim.common.dataclasses import Trajectory
-from navsim.evaluate.pdm_score import pdm_score
+from navsim.evaluate.pdm_score import pdm_score_para
 from navsim.planning.simulation.planner.pdm_planner.scoring.pdm_scorer import PDMScorer
 from navsim.planning.simulation.planner.pdm_planner.simulation.pdm_simulator import PDMSimulator
+
+PDM_LOG_KEYS = (
+    "no_at_fault_collisions",
+    "drivable_area_compliance",
+    "ego_progress",
+    "time_to_collision_within_bound",
+    "comfort",
+    "driving_direction_compliance",
+    "score",
+)
 
 
 def _transform_navi_to_camera_tensor(
@@ -1658,20 +1668,45 @@ class TrajectoryHead(nn.Module):
         with lzma.open(metric_cache_path, "rb") as f:
             return pickle.load(f)
 
-    def reward_fn(self, pred_traj: torch.Tensor, metric_cache_paths) -> torch.Tensor:
+    def reward_fn(self, pred_traj: torch.Tensor, metric_cache_paths) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         pred_np = pred_traj.detach().float().cpu().numpy()
-        rewards = []
-        for i, metric_cache_path in enumerate(metric_cache_paths):
+        rewards = [0.0] * len(metric_cache_paths)
+        metric_values = {key: [0.0] * len(metric_cache_paths) for key in PDM_LOG_KEYS}
+        index = 0
+        num_paths = len(metric_cache_paths)
+        while index < num_paths:
+            metric_cache_path = str(metric_cache_paths[index])
+            end_index = index + 1
+            while end_index < num_paths and str(metric_cache_paths[end_index]) == metric_cache_path:
+                end_index += 1
+
             metric_cache = self._load_metric_cache(metric_cache_path)
-            pdm_result = pdm_score(
+            trajectories = [
+                Trajectory(pred_np[trajectory_index], trajectory_sampling=self._config.trajectory_sampling)
+                for trajectory_index in range(index, end_index)
+            ]
+            pdm_results = pdm_score_para(
                 metric_cache=metric_cache,
-                model_trajectory=Trajectory(pred_np[i], trajectory_sampling=self._config.trajectory_sampling),
+                model_trajectory=trajectories,
                 future_sampling=self._config.trajectory_sampling,
                 simulator=self.simulator,
                 scorer=self.train_scorer,
             )
-            rewards.append(asdict(pdm_result)["score"])
-        return torch.tensor(rewards, device=pred_traj.device, dtype=torch.float32).detach()
+            if isinstance(pdm_results, tuple):
+                pdm_results = pdm_results[0]
+            for trajectory_index, pdm_result in zip(range(index, end_index), pdm_results):
+                pdm_metrics = asdict(pdm_result)
+                rewards[trajectory_index] = float(pdm_metrics["score"])
+                for key in PDM_LOG_KEYS:
+                    metric_values[key][trajectory_index] = float(pdm_metrics[key])
+            index = end_index
+
+        reward_tensor = torch.tensor(rewards, device=pred_traj.device, dtype=torch.float32).detach()
+        metric_tensors = {
+            f"pdm_{key}": torch.tensor(values, device=pred_traj.device, dtype=torch.float32).mean().detach()
+            for key, values in metric_values.items()
+        }
+        return reward_tensor, metric_tensors
 
     def forward_grpo(
         self,
@@ -1731,7 +1766,8 @@ class TrajectoryHead(nn.Module):
             )
             if wm_selector is not None and wm_keyval is not None:
                 sampled = wm_selector(sampled, wm_keyval)
-        rewards = self.reward_fn(sampled["trajectory"], metric_cache_paths_rep).float()
+        rewards, pdm_metrics = self.reward_fn(sampled["trajectory"], metric_cache_paths_rep)
+        rewards = rewards.float()
         rewards_matrix = rewards.view(batch_size, sample_time)
         mean_r = rewards_matrix.mean(dim=1, keepdim=True)
         std_r = rewards_matrix.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-8)
@@ -1805,6 +1841,7 @@ class TrajectoryHead(nn.Module):
             "reward": rewards.mean(),
             "policy_loss": policy_loss,
             "bc_loss": bc_loss,
+            **pdm_metrics,
         }
 
     def forward_test(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,global_img,goalpoint=None,points_score=1.0) -> Dict[str, torch.Tensor]:

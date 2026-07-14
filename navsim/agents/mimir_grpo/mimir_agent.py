@@ -177,12 +177,20 @@ class MimirAgent(AbstractAgent):
     ) -> torch.Tensor:
         """Inherited, see superclass."""
         if self.training and self._config.grpo:
-            return {
+            loss_dict = {
                 "loss": predictions["loss"],
                 "reward": predictions.get("reward"),
                 "policy_loss": predictions.get("policy_loss"),
                 "bc_loss": predictions.get("bc_loss"),
             }
+            loss_dict.update(
+                {
+                    key: value
+                    for key, value in predictions.items()
+                    if key.startswith("pdm_")
+                }
+            )
+            return loss_dict
         return mimir_loss(targets, predictions, self._config)
 
     def get_optimizers(self) -> Union[Optimizer, Dict[str, Union[Optimizer, LRScheduler]]]:

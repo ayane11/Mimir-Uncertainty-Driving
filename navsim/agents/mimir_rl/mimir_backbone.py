@@ -153,8 +153,8 @@ class MimirBackbone(nn.Module):
         """
         image_features, lidar_features = image, lidar
 
-        if self.config.latent:
-            batch_size = lidar.shape[0]
+        if self.config.latent and lidar_features is None:
+            batch_size = image.shape[0]
             lidar_features = self.lidar_latent.repeat(batch_size, 1, 1, 1)
 
         # Generate an iterator for all the layers in the network that one can loop through.
@@ -223,7 +223,7 @@ class MimirBackbone(nn.Module):
 
     def fuse_features(self, image_features, lidar_features, layer_idx):
         """
-        Perform a Mimir feature fusion block using a Transformer module.
+        Perform a TransFuser feature fusion block using a Transformer module.
         :param image_features: Features from the image branch
         :param lidar_features: Features from the LiDAR branch
         :param layer_idx: Transformer layer index.

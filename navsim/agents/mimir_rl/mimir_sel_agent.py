@@ -45,6 +45,7 @@ class MimirSelAgent(AbstractAgent):
         config: MimirConfig,
         lr: float,
         checkpoint_path: Optional[str] = None,
+        traj_save_path: str='',
     ):
         """
         Initializes Mimir selector agent.
@@ -56,6 +57,7 @@ class MimirSelAgent(AbstractAgent):
 
         self._config = config
         self._lr = lr
+        self.traj_save_path=traj_save_path
         self._checkpoint_path = checkpoint_path
         self._mimir_model = MimirSelModel(config)
         trainable_prefixes = [
@@ -140,6 +142,12 @@ class MimirSelAgent(AbstractAgent):
             features = {k: v.unsqueeze(0) for k, v in features.items()}
             predictions = self.forward(features, token=token)
             poses = predictions["trajectory"].squeeze(0).cpu().numpy()
+
+            # if self.traj_save_path and token is not None:
+            #     traj_save_dir = Path(self.traj_save_path)
+            #     traj_save_dir.mkdir(parents=True, exist_ok=True)
+            #     np.save(traj_save_dir / f"{token}.npy", poses)
+
         return Trajectory(poses)
 
     def compute_loss(
@@ -228,4 +236,5 @@ class MimirSelAgent(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        return [MimirCallback(self._config)]
+        return [MimirCallback(self._config),
+                pl.callbacks.ModelCheckpoint(every_n_epochs=1, save_top_k=-1, monitor="epoch", mode="max"), ]

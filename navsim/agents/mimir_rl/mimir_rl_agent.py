@@ -211,4 +211,5 @@ class MimirRlAgent(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        return [MimirCallback(self._config)]
+        return [MimirCallback(self._config),
+                pl.callbacks.ModelCheckpoint(every_n_epochs=1, save_top_k=-1, monitor="epoch", mode="max"), ]

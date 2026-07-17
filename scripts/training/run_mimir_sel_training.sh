@@ -13,7 +13,7 @@ export OPENBLAS_CORETYPE=Haswell
 # ============================================ training for unc ====================================================
 CACHE_PATH='/data/openscene/cache/mimir_feature_cache'
 TRAIN_METRIC_CACHE_PATH='/data/openscene/cache/navtrain_metric_cache'
-CHECKPOINT_PATH='/home/navsim/exp/a_train_mimir_agent_rl/2026.05.13.19.19.36/lightning_logs/version_0/checkpoints/epoch\=9-step\=13300.ckpt'
+CHECKPOINT_PATH='/home/navsim/exp/a_train_mimir_agent_rl/2026.07.06.14.44.15/lightning_logs/version_0/checkpoints/epoch\=9-step\=13300.ckpt'
 COORD_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/navi_dict.npy'
 UNC_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/unc_dict.npy'
 
@@ -29,7 +29,6 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     +train_metric_cache_path=$TRAIN_METRIC_CACHE_PATH \
     dataloader.params.batch_size=64 \
     trainer.params.max_epochs=20 \
-    trainer.params.strategy=ddp_find_unused_parameters_true \
     force_cache_computation=False \
     agent.checkpoint_path=$CHECKPOINT_PATH \
     agent.config.latent=False \
@@ -38,6 +37,6 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     agent.config.use_gt_goal_train=False \
     agent.config.status_norm=False \
     agent.config.use_unc_score=True \
-    agent.config.use_wm=True \
+    agent.config.use_wm=False \
     agent.config.unc_path=$UNC_PATH \
     agent.config.navi_path=$COORD_PATH

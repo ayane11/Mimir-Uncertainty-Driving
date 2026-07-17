@@ -38,6 +38,6 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     agent.config.use_gt_goal_train=False \
     agent.config.status_norm=False \
     agent.config.use_unc_score=True \
-    agent.config.use_wm=True \
+    agent.config.use_wm=False \
     agent.config.unc_path=$UNC_PATH \
     agent.config.navi_path=$COORD_PATH

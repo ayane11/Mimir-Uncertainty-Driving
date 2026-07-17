@@ -150,82 +150,89 @@ def _init_pool(sim_cfg, scorer_cfg):
     SCORER    = instantiate(scorer_cfg)
 
 def _transform_navi_to_camera_tensor(
-    navi: torch.Tensor,
-    sensor2lidar_rotation: torch.Tensor,
-    sensor2lidar_translation: torch.Tensor,
+    navi: torch.Tensor,                     # (N, 3)
+    sensor2lidar_rotation: torch.Tensor,   # (3, 3)
+    sensor2lidar_translation: torch.Tensor # (3,)
 ) -> torch.Tensor:
+    """
+    将导航点从 VCS 坐标变换到摄像机坐标系
+    """
     lidar2cam_r = sensor2lidar_rotation.inverse()
     lidar2cam_t = -torch.matmul(lidar2cam_r, sensor2lidar_translation)
 
-    locs_homo = torch.cat([navi, torch.ones_like(navi[:, :1])], dim=-1)
+    locs_homo = torch.cat([navi, torch.ones_like(navi[:, :1])], dim=-1)  # (N, 4)
+
+    # 构建 4x4 齐次变换矩阵
     lidar2cam_rt = torch.eye(4, device=navi.device).to(navi)
     lidar2cam_rt[:3, :3] = lidar2cam_r
     lidar2cam_rt[:3, 3] = lidar2cam_t
-    return torch.matmul(lidar2cam_rt, locs_homo.T).T[:, :3]
 
+    locs_cam = torch.matmul(lidar2cam_rt, locs_homo.T).T[:, :3]  # (N, 3)
+    return locs_cam
 
 def _project_points_to_image_tensor(
-    points: torch.Tensor,
-    intrinsics: torch.Tensor,
+    points: torch.Tensor,           # (N, 3) in camera frame
+    intrinsics: torch.Tensor,      # (3, 3)
     image_shape: Optional[Tuple[int, int]] = None,
     eps: float = 1e-3,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_points = points.shape[0]
-    pc_homo = torch.cat(
-        [points, torch.ones((num_points, 1), device=points.device, dtype=points.dtype)],
-        dim=-1,
-    )
-    intrinsics_pad = torch.eye(4, device=points.device, dtype=points.dtype)
+    """
+    将摄像机系下的点投影到图像像素平面
+    返回 (N, 2) 像素位置 + mask 是否在图像有效区域
+    """
+    N = points.shape[0]
+    pc_homo = torch.cat([points, torch.ones((N, 1), device=points.device,dtype=points.dtype)], dim=-1)  # (N, 4)
+    intrinsics_pad = torch.eye(4, device=points.device,dtype=points.dtype)
     intrinsics_pad[:3, :3] = intrinsics
 
-    proj = torch.matmul(pc_homo, intrinsics_pad.T)
+    proj = torch.matmul(pc_homo, intrinsics_pad.T)  # (N, 4)
     z = proj[:, 2:3].clamp(min=eps)
-    xy = proj[:, 0:2] / z
+    xy = proj[:, 0:2] / z  # (N, 2)
+
     in_fov = proj[:, 2] > eps
 
     if image_shape is not None:
-        height, width = image_shape
+        H, W = image_shape
         u, v = xy[:, 0], xy[:, 1]
-        in_bounds = (u >= 0) & (u < width - 1) & (v >= 0) & (v < height - 1)
+        in_bounds = (u >= 0) & (u < W - 1) & (v >= 0) & (v < H - 1)
         in_fov = in_fov & in_bounds
 
     return xy, in_fov
 
-
 def extract_feature_values_at_navi_batched(
-    feature_map: torch.Tensor,
-    navi_tensor: torch.Tensor,
-    sensor2lidar_rotation: torch.Tensor,
-    sensor2lidar_translation: torch.Tensor,
-    intrinsics: torch.Tensor,
-    image_shape: Tuple[int, int],
+    feature_map: torch.Tensor,                 # (B, C_feat, H_feat, W_feat)
+    navi_tensor: torch.Tensor,                 # (B, N, 3)
+    sensor2lidar_rotation: torch.Tensor,       # (B, 3, 3)
+    sensor2lidar_translation: torch.Tensor,    # (B, 3)
+    intrinsics: torch.Tensor,                  # (B, 3, 3)
+    image_shape: Tuple[int, int]               # 原始图像尺寸 (H_img, W_img)
 ) -> torch.Tensor:
-    batch_size, channels, height_feat, width_feat = feature_map.shape
-    _, num_points, _ = navi_tensor.shape
-    height_img, width_img = image_shape
-    feature_values = torch.zeros((batch_size, channels, num_points), device=navi_tensor.device)
+    B, C_feat, H_feat, W_feat = feature_map.shape
+    _, N, _ = navi_tensor.shape
+    H_img, W_img = image_shape
+    device = navi_tensor.device
 
-    for batch_idx in range(batch_size):
+    feature_values = torch.zeros((B, C_feat, N), device=device)
+
+    for b in range(B):
+        # 单图提取
         navi_cam = _transform_navi_to_camera_tensor(
-            navi_tensor[batch_idx],
-            sensor2lidar_rotation[batch_idx],
-            sensor2lidar_translation[batch_idx],
+            navi_tensor[b], sensor2lidar_rotation[b], sensor2lidar_translation[b]
         )
         pixel_coords, valid_mask = _project_points_to_image_tensor(
-            navi_cam,
-            intrinsics[batch_idx],
-            image_shape=image_shape,
+            navi_cam, intrinsics[b], image_shape=image_shape
         )
+        # 缩放到特征图分辨率
         pixel_coords_scaled = pixel_coords.clone()
-        pixel_coords_scaled[:, 0] *= width_feat / width_img
-        pixel_coords_scaled[:, 1] *= height_feat / height_img
+        pixel_coords_scaled[:, 0] *= W_feat / W_img
+        pixel_coords_scaled[:, 1] *= H_feat / H_img
 
-        u = pixel_coords_scaled[:, 0].round().long().clamp(0, width_feat - 1)
-        v = pixel_coords_scaled[:, 1].round().long().clamp(0, height_feat - 1)
-        feature_values[batch_idx] = feature_map[batch_idx, :, v, u] * valid_mask.unsqueeze(0)
+        u = pixel_coords_scaled[:, 0].round().long().clamp(0, W_feat - 1)
+        v = pixel_coords_scaled[:, 1].round().long().clamp(0, H_feat - 1)
 
-    return feature_values
+        feature_values[b] = feature_map[b, :, v, u] * valid_mask.unsqueeze(0)
 
+    return feature_values  # shape: (B, C_feat, N)
 
 def load_navis_from_np(data_dict, token, num_goal_points: int = 1):
     tokens = [token] if isinstance(token, str) else list(token)
@@ -240,7 +247,7 @@ def load_navis_from_np(data_dict, token, num_goal_points: int = 1):
 
 class RewardConvNet(nn.Module):
     def __init__(self, input_channels: int, conv1_out_channels: int, conv2_out_channels: int):
-        super().__init__()
+        super(RewardConvNet, self).__init__()
         self.conv1 = nn.Conv2d(
             in_channels=input_channels,
             out_channels=conv1_out_channels,
@@ -294,7 +301,7 @@ class MimirSelModel(nn.Module):
         # usually, the BEV features are variable in size.
         self._bev_downscale = nn.Conv2d(512, config.tf_d_model, kernel_size=1)
         if self._config.status_norm:
-            self._status_encoding = nn.Linear(4 + 1 + 1, config.tf_d_model)
+            self._status_encoding=nn.Linear(4+1+1,config.tf_d_model)
         else:
             self._status_encoding = nn.Linear(4 + 2 + 2, config.tf_d_model)
 
@@ -349,13 +356,13 @@ class MimirSelModel(nn.Module):
         self.bev_proj = nn.Sequential(
             *linear_relu_ln(256, 1, 1,320),
         )
-        self.weight_score = None
+        self.weight_score=None
         if self._config.unc_path:
-            self.weight_score = np.load(self._config.unc_path, allow_pickle=True).item()
+            self.weight_score=np.load(self._config.unc_path,allow_pickle=True).item()
 
-        self.goalpoints = None
+        self.goalpoints=None
         if self._config.navi_path:
-            self.goalpoints = np.load(self._config.navi_path, allow_pickle=True).item()
+            self.goalpoints=np.load(self._config.navi_path,allow_pickle=True).item()
 
         if self._config.use_wm:
             self._wm_num_future_frames = int(getattr(config, "wm_num_future_frames", 3))
@@ -434,63 +441,52 @@ class MimirSelModel(nn.Module):
         else:
             lidar_feature: torch.Tensor = features["lidar_feature"]
         status_feature: torch.Tensor = features["status_feature"]
-        if metric_cache is None:
-            metric_cache = features.get("metric_cache_path")
-        if token is None:
-            token = features.get("token")
-        if self._config.status_norm and self._config.training == False:
-            vle = torch.norm(status_feature[:, 4:6], dim=-1, keepdim=True)
-            acc = torch.norm(status_feature[:, 6:8], dim=-1, keepdim=True)
-            dot_product = torch.sum(status_feature[:, 4:6] * status_feature[:, 6:8], dim=-1, keepdim=True)
-            tag_vle = torch.where(status_feature[:, 4:5] >= 0, 1.0, -1.0)
-            tag_acc = torch.where(dot_product > 0, 1.0, -1.0)
-            status_feature = torch.cat([status_feature[:, :4], tag_vle * vle, tag_acc * acc], dim=-1)
-
+        if self._config.status_norm and self._config.training==False:
+            vle = torch.norm(status_feature[:,4:6],dim=-1,keepdim=True)
+            acc = torch.norm(status_feature[:,6:8],dim=-1,keepdim=True)
+            dot_product = torch.sum(status_feature[:,4:6]*status_feature[:,6:8],dim=-1,keepdim=True)
+            tag_vle = torch.where(status_feature[:,4:5] >= 0,1.0,-1.0)
+            tag_acc = torch.where(dot_product > 0,1.0,-1.0)
+            status_feature= torch.cat([status_feature[:,:4], tag_vle*vle,tag_acc*acc], dim=-1)
+        
+        
         batch_size = status_feature.shape[0]
 
         bev_feature_upscale, bev_feature, img_feature = self._backbone(camera_feature, lidar_feature)
-        if self.weight_score:
-            points_score = load_navis_from_np(self.weight_score, token, self._config.num_goal_points).to(bev_feature)
-        else:
-            points_score = None
-
-        if self.goalpoints:
-            goalpoint = load_navis_from_np(self.goalpoints, token, self._config.num_goal_points).to(bev_feature)
-        else:
-            goalpoint = None
-
         if self._config.training and self._config.use_proj_image:
-            navis = features["gt_trajs"][:, -1:, :]
-            navis[:, :, 2] = 0.0
-            rotation = features["sensor2lidar_rot"][:, 0].to(navis)
-            translation = features["sensor2lidar_trans"][:, 0].to(navis)
-            intrinsic = features["intrinsic"][:, 0].to(navis)
-            pix = extract_feature_values_at_navi_batched(
-                img_feature[:, :, :, 17:-17],
-                navis,
-                rotation,
-                translation,
-                intrinsic,
-                (1024, 1920),
-            )
-        elif self._config.use_proj_image and goalpoint is not None:
-            rotation = features["sensor2lidar_rot"][:, 0].to(camera_feature)
-            translation = features["sensor2lidar_trans"][:, 0].to(camera_feature)
-            intrinsic = features["intrinsic"][:, 0].to(camera_feature)
-            goalpoint_tensor = goalpoint[:, :1, :].to(camera_feature)
-            zeros = torch.zeros_like(goalpoint_tensor[..., :1])
-            goalpoint_tensor = torch.cat([goalpoint_tensor, zeros], dim=-1)
-            pix = extract_feature_values_at_navi_batched(
-                img_feature[:, :, :, 17:-17],
-                goalpoint_tensor,
-                rotation,
-                translation,
-                intrinsic,
-                (1024, 1920),
-            )
+            navis=features['gt_trajs'][:,-1:,:]
+            navis[:,:,2]=0.0
+            R=features['sensor2lidar_rot'][:,0].to(navis)
+            T=features['sensor2lidar_trans'][:,0].to(navis)
+            K=features['intrinsic'][:,0].to(navis)
+            pix=extract_feature_values_at_navi_batched(img_feature[:,:,:,17:-17],navis,R,T,K,(1024,1920))
+        elif self._config.use_proj_image:
+            R=features['sensor2lidar_rot'][:,0].to(camera_feature)
+            T=features['sensor2lidar_trans'][:,0].to(camera_feature)
+            K=features['intrinsic'][:,0].to(camera_feature)
+            goalpoint_tensor=torch.from_numpy(goalpoint).to(camera_feature).unsqueeze(0).unsqueeze(0)
+            zeros=torch.zeros_like(goalpoint_tensor)
+            goalpoint_tensor=torch.cat([goalpoint_tensor,zeros[:,:,-1:]],dim=-1)
+            pix=extract_feature_values_at_navi_batched(img_feature[:,:,:,17:-17],goalpoint_tensor,R,T,K,(1024,1920))
         else:
-            pix = None
+            pix=None
+        # pix.shape [bs,256,1]
 
+        if self.weight_score:
+            if self._config.training:
+                points_score=load_navis_from_np(self.weight_score,features['token'],self._config.num_goal_points).to(bev_feature)
+            else:
+                points_score=load_navis_from_np(self.weight_score,token,self._config.num_goal_points).to(bev_feature)
+        else:
+            points_score=None
+        
+        if self.goalpoints:
+            if self._config.training:
+                goalpoint=load_navis_from_np(self.goalpoints,features['token'],self._config.num_goal_points).to(bev_feature)
+            else:
+                goalpoint=load_navis_from_np(self.goalpoints,token,self._config.num_goal_points).to(bev_feature)
+        else:
+            goalpoint=None
         cross_bev_feature = bev_feature_upscale
         bev_spatial_shape = bev_feature_upscale.shape[2:]
         concat_cross_bev_shape = bev_feature.shape[2:]
@@ -528,7 +524,15 @@ class MimirSelModel(nn.Module):
             self._add_wm_candidate_selection_outputs(output, keyval)
             self._apply_wm_candidate_selection(output)
 
-            if targets is not None and "trajectory" in output:
+            if targets is not None:
+                if "wm_future_bev_semantic_map" not in targets:
+                    target_keys = ", ".join(sorted(targets.keys()))
+                    raise RuntimeError(
+                        "use_wm=True requires future BEV semantic map targets, but none were found. "
+                        "Rebuild the cache with the WM future BEV target builder, "
+                        f"and check target keys. Received target keys: {target_keys}"
+                    )
+
                 wm_training_trajectory = output["trajectory"]
                 if wm_training_trajectory.ndim == 4:
                     wm_training_trajectory = wm_training_trajectory[:, -1]
@@ -544,6 +548,8 @@ class MimirSelModel(nn.Module):
         initial_latent: torch.Tensor,
         trajectory: torch.Tensor,
     ) -> torch.Tensor:
+        """Predict future ego-frame BEV maps from latent WM rollout."""
+
         wm_future_latents = self._rollout_wm_future_latents(
             initial_latent=initial_latent,
             trajectory=trajectory,
@@ -561,13 +567,16 @@ class MimirSelModel(nn.Module):
         window_num_poses: int,
         action_encoder: nn.Module,
     ) -> torch.Tensor:
+        """Roll out future latent scene tokens conditioned by a candidate trajectory."""
+
         wm_latent = initial_latent
         wm_future_latents = []
 
         for future_offset in range(1, num_future_frames + 1):
+            window_start = future_offset - 1
             wm_trajectory = self._get_wm_trajectory_window(
                 trajectory=trajectory,
-                window_start=future_offset - 1,
+                window_start=window_start,
                 window_num_poses=window_num_poses,
             )
             wm_latent = self._predict_next_latent(
@@ -596,6 +605,8 @@ class MimirSelModel(nn.Module):
         output: Dict[str, torch.Tensor],
         keyval: torch.Tensor,
     ) -> None:
+        """Score all trajectory candidates with a WoTE-style WM reward head."""
+
         candidate_trajectories = output.get("candidate_trajectories")
         candidate_logits = output.get("candidate_logits")
         if candidate_trajectories is None or candidate_logits is None:
@@ -657,6 +668,8 @@ class MimirSelModel(nn.Module):
         output: Dict[str, torch.Tensor],
         num_candidates: int,
     ) -> int:
+        """Use the training-time candidate count as the max number of WM-scored candidates."""
+
         anchor_count = int(self._trajectory_head.plan_anchor.shape[0])
         if anchor_count <= 0:
             return num_candidates
@@ -674,8 +687,10 @@ class MimirSelModel(nn.Module):
         initial_latent: torch.Tensor,
         wm_future_latents: torch.Tensor,
     ) -> torch.Tensor:
+        """Build WoTE-style reward features from current and predicted future latents."""
+
         all_latents = torch.cat([initial_latent[:, None], wm_future_latents], dim=1)
-        batch_size, num_steps, _, channels = all_latents.shape
+        batch_size, num_steps, num_tokens, channels = all_latents.shape
 
         bev_tokens = all_latents[:, :, :-1]
         bev_side = int(np.sqrt(bev_tokens.shape[2]))
@@ -726,6 +741,8 @@ class MimirSelModel(nn.Module):
             ).squeeze(1)
 
     def _decode_wm_bev_semantic_map(self, wm_latent: torch.Tensor) -> torch.Tensor:
+        """Decode predicted WM latent tokens into a future ego-frame BEV semantic map."""
+
         batch_size, _, channels = wm_latent.shape
         bev_tokens = wm_latent[:, :-1]
         bev_side = int(np.sqrt(bev_tokens.shape[1]))
@@ -751,6 +768,7 @@ class MimirSelModel(nn.Module):
         prev_trajectory: torch.Tensor,
         action_encoder: nn.Module,
     ) -> torch.Tensor:
+        """Predict next ego-frame latent tokens after injecting ego/trajectory feature into BEV tokens."""
         ego_trajectory_latent = self._encode_wm_ego_trajectory_feature(
             prev_latent=prev_latent,
             prev_trajectory=prev_trajectory,
@@ -880,6 +898,7 @@ class MimirSelModel(nn.Module):
         window_start: int,
         window_num_poses: int,
     ) -> torch.Tensor:
+        """Take a path slice and express it in the previous predicted ego frame."""
         window_end = window_start + window_num_poses
         if window_end > trajectory.shape[1]:
             raise ValueError(
@@ -1026,11 +1045,14 @@ class ModulationLayer(nn.Module):
                 ], axis=-1)
         else:
             global_feature = time_embed
-        if global_img is not None:
-            global_img = global_img.flatten(2,3).permute(0,2,1).contiguous()
-            global_feature = torch.cat([
-                    global_img, global_feature
-                ], axis=-1)
+        # if global_img is not None:
+        #     if len(global_img.shape)==4:
+        #         global_img = global_img.flatten(2,3).permute(0,2,1).contiguous()
+        #     else:
+        #         global_img = global_img.permute(0,2,1).contiguous()
+        #     global_feature = torch.cat([
+        #             global_img, global_feature
+        #         ], axis=-1)
         
         scale_shift = self.scale_shift_mlp(global_feature)
         scale,shift = scale_shift.chunk(2,dim=-1)
@@ -1170,8 +1192,10 @@ class CustomTransformerDecoderLayer(nn.Module):
             config=config,
             in_bev_dims=256,
         )
-        if config.use_unc_score == True:
-            self.cross_bev_attention_navi = GridSampleCrossBEVAttention_naviscore(
+
+        # GridSampleCrossBEVAttention_navi
+        if config.use_unc_score==True:
+            self.cross_bev_attention_navi= GridSampleCrossBEVAttention_naviscore(
                 config.tf_d_model,
                 config.tf_num_head,
                 num_points=1,
@@ -1224,16 +1248,12 @@ class CustomTransformerDecoderLayer(nn.Module):
                 status_encoding,
                 global_img=None,
                 navi_points=None,
-                points_score=1.0):
+                points_score=1.0,
+                ):
         traj_feature = self.cross_bev_attention(traj_feature,noisy_traj_points,bev_feature,bev_spatial_shape)
         if navi_points is not None:
-            traj_feature = self.cross_bev_attention_navi(
-                traj_feature,
-                navi_points,
-                bev_feature,
-                bev_spatial_shape,
-                points_score,
-            )
+            traj_feature = self.cross_bev_attention_navi(traj_feature,navi_points,bev_feature,bev_spatial_shape,points_score)
+        
         traj_feature = traj_feature + self.dropout(self.cross_agent_attention(traj_feature, agents_query,agents_query)[0])
         traj_feature = self.norm1(traj_feature)
         
@@ -1246,7 +1266,7 @@ class CustomTransformerDecoderLayer(nn.Module):
         # 4.6 feedforward network
         traj_feature = self.norm3(self.ffn(traj_feature))
         # 4.8 modulate with time steps
-        traj_feature = self.time_modulation(traj_feature, time_embed,global_cond=None,global_img=global_img)
+        traj_feature = self.time_modulation(traj_feature, time_embed,global_cond=None,global_img=None)
         
         # 4.9 predict the offset & heading
         traj_feature = traj_feature.view(traj_feature.shape[0], -1, 20, traj_feature.shape[-1])
@@ -1287,7 +1307,8 @@ class CustomTransformerDecoder(nn.Module):
                 status_encoding,
                 global_img=None,
                 navi_points=None,
-                points_score=1.0):
+                points_score=1.0,
+                ):
         poses_reg_list = []
         poses_cls_list = []
         traj_points = noisy_traj_points
@@ -1589,7 +1610,7 @@ class TrajectoryHead(nn.Module):
         self.scorer_cfg = pdm_cfg.scorer
 
         self._pdm_pool = cf.ProcessPoolExecutor(
-            max_workers=24,
+            max_workers=16,
             mp_context=mp.get_context("spawn"),
             initializer=_init_pool,
             initargs=(self.simulator_cfg, self.scorer_cfg),
@@ -1634,6 +1655,20 @@ class TrajectoryHead(nn.Module):
             goal_count * num_modes,
             *tensor.shape[2:],
         )
+    
+    def _add_goal_condition(self, traj_feature, bs, ego_fut_mode, goalpoint=None, points_score=None):
+        traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
+        if goalpoint is None:
+            return traj_feature
+        if points_score is None:
+            points_score = torch.ones_like(goalpoint)
+        goal_info_embed = gen_sineembed_for_position(
+            torch.stack([goalpoint.squeeze(2), points_score.squeeze(2)], dim=2),
+            hidden_dim=128,
+        )
+        goal_info_embed = goal_info_embed.flatten(-2)
+        goal_info_feature = self.goalpoint_encoder(goal_info_embed)
+        return traj_feature + goal_info_feature.view(bs, ego_fut_mode, -1)
 
     @staticmethod
     def _build_per_query_goal_inputs(goalpoint, points_score, modes_per_goal):
@@ -1687,20 +1722,6 @@ class TrajectoryHead(nn.Module):
         sim_traj = [f.result()[3] for f in futures]
         sim_traj = np.stack(sim_traj, axis=0)
         return torch.from_numpy(scores_np).to(trajectory.device), metric_cache, sub_scores, sim_traj
-
-    def _add_goal_condition(self, traj_feature, bs, ego_fut_mode, goalpoint=None, points_score=None):
-        traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
-        if goalpoint is None:
-            return traj_feature
-        if points_score is None:
-            points_score = torch.ones_like(goalpoint)
-        goal_info_embed = gen_sineembed_for_position(
-            torch.stack([goalpoint.squeeze(2), points_score.squeeze(2)], dim=2),
-            hidden_dim=128,
-        )
-        goal_info_embed = goal_info_embed.flatten(-2)
-        goal_info_feature = self.goalpoint_encoder(goal_info_embed)
-        return traj_feature + goal_info_feature.view(bs, ego_fut_mode, -1)
 
     def _score_coarse(
         self,
@@ -2135,16 +2156,7 @@ class TrajectoryHead(nn.Module):
         reward_dict = fine_reward_dict
         reward_dict['coarse_reward'] = coarse_reward.mean()
         loss = loss_fine + loss_coarse
-        best_idx = final_coarse_reward.argmax(dim=-1)
-        best_traj = diffusion_output[torch.arange(bs, device=device), best_idx]
-        return {
-            "loss": loss,
-            "trajectory": best_traj,
-            "candidate_trajectories": diffusion_output,
-            "candidate_logits": final_coarse_reward,
-            "sub_loss_dict": sub_loss_dict,
-            "reward_dict": reward_dict,
-        } 
+        return {"loss":loss,"sub_loss_dict": sub_loss_dict, "reward_dict": reward_dict} 
 
 
     def forward_test_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img,metric_cache,eta=1.0,token=None,goalpoint=None,points_score=None) -> Dict[str, torch.Tensor]:
@@ -2271,13 +2283,8 @@ class TrajectoryHead(nn.Module):
             
         traj_to_score = torch.cat(traj_to_score, dim=1)
 
-        selected_trajectory = traj_to_score[:, -1]
-
-        return {
-            "trajectory": selected_trajectory,
-            "candidate_trajectories": diffusion_output,
-            "candidate_logits": final_coarse_reward,
-        }
+        # for official eval
+        # return {"trajectory": traj_to_score[:,-1]}
 
         reward_group, metric_cache, sub_rewards_group, _ = self.get_pdm_score_para(traj_to_score, metric_cache)
         reward_dict = {}

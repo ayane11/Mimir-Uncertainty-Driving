@@ -14,8 +14,8 @@ export OPENBLAS_CORETYPE=Haswell
 CACHE_PATH='/data/openscene/cache/mimir_feature_cache'
 TRAIN_METRIC_CACHE_PATH='/data/openscene/cache/navtrain_metric_cache'
 CHECKPOINT_PATH='/home/navsim/exp/a_navtrain_mimir_agent_traj/mimir_final_90.0/lightning_logs/version_0/checkpoints/best-epoch\=96.ckpt'
-COORD_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/navi_dict.npy'
-UNC_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/unc_dict.npy'
+COORD_PATH='/home/navsim/dataset/naviunc/a_navtrain_3_05_merge/navi_dict.npy'
+UNC_PATH='/home/navsim/dataset/naviunc/a_navtrain_3_05_merge/unc_dict.npy'
 
 # RL reward requires PDM metric caches under:
 # $TRAIN_METRIC_CACHE_PATH/<log>/$TRAIN_METRIC_CACHE_SCENARIO_TYPE/<token>/metric_cache.pkl
@@ -40,4 +40,6 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     agent.config.use_unc_score=True \
     agent.config.use_wm=False \
     agent.config.unc_path=$UNC_PATH \
-    agent.config.navi_path=$COORD_PATH
+    agent.config.navi_path=$COORD_PATH \
+    agent.config.num_goal_points=3 \
+    agent.lr=1e-5 

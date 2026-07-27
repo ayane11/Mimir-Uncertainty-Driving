@@ -11,23 +11,28 @@ export OPENBLAS_CORETYPE=Haswell
 
 # ============================================ training for unc ====================================================
 CACHE_PATH='/data/openscene/cache/mimir_feature_cache'
-COORD_PATH='/home/navsim/dataset/navtrain_naviunc/navi.npy' # training using predition of mimir unc
-UNC_PATH='/home/navsim/dataset/navtrain_naviunc/unc.npy'
+COORD_PATH='/home/navsim/dataset/naviunc/a_navtrain_3_05_merge/navi_dict.npy'
+UNC_PATH='/home/navsim/dataset/naviunc/a_navtrain_3_05_merge/unc_dict.npy'
+NEGATIVE_SAMPLES_PATH='/home/navsim/dataset/sample_step5_cfg0.5_noise0.4_proposal64/2026.01.07.03.26.47/negative_sample_results/'
 
 python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
-    agent=mimir_agent \
+    agent=mimir_final_agent \
     experiment_name=a_navtrain_mimir_agent_traj \
     train_test_split=$TRAIN_TEST_SPLIT \
     use_cache_without_dataset=True \
     cache_path=$CACHE_PATH \
+    negative_samples_path=$NEGATIVE_SAMPLES_PATH \
     dataloader.params.batch_size=64 \
     trainer.params.max_epochs=100 \
     force_cache_computation=False \
     agent.config.latent=False \
     agent.config.training=True \
+    agent.config.num_goal_points=3 \
     agent.config.use_proj_image=False \
     agent.config.use_gt_goal_train=False \
     agent.config.status_norm=False \
     agent.config.use_unc_score=True \
+    agent.config.use_beyonddrive=True \
     agent.config.unc_path=$UNC_PATH \
-    agent.config.navi_path=$COORD_PATH
+    agent.config.navi_path=$COORD_PATH \
+    agent.config.use_wm=True

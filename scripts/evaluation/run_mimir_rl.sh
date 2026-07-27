@@ -8,18 +8,17 @@ export OPENBLAS_CORETYPE=Haswell
 
 # ====================================== use unc to train ==============================================================
 METRIC_CACHE_PATH='/home/navsim/exp/metric_cache'
-CHECKPOINT_PATH='/home/navsim/exp/a_train_mimir_agent_sel/2026.07.19.11.55.08/lightning_logs/version_0/checkpoints/epoch\=4-step\=6650.ckpt'
-GOAL_COORD_PATH='/home/navsim/dataset/naviunc/navtest_naviunc/navi_dict.npy'
-UNC_PATH='/home/navsim/dataset/naviunc/navtest_naviunc/unc_dict.npy'
+CHECKPOINT_PATH='/home/navsim/exp/a_train_mimir_agent_rl/2026.07.18.22.14.22/lightning_logs/version_0/checkpoints/epoch\=9-step\=13300.ckpt'
+GOAL_COORD_PATH='/home/navsim/dataset/naviunc/a_navtest_3_05_merge/navi_dict.npy'
+UNC_PATH='/home/navsim/dataset/naviunc/a_navtest_3_05_merge/unc_dict.npy'
 TRAJ_SAVE_PATH='/home/navsim/dataset/trajs'
 
 python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
-    agent=mimir_sel_agent \
+    agent=mimir_rl_agent \
     train_test_split=navtest \
     experiment_name=a_navtest_mimir_agent_traj_eval \
     worker=ray_distributed \
     metric_cache_path=$METRIC_CACHE_PATH \
-    +agent.traj_save_path=$TRAJ_SAVE_PATH \
     agent.config.latent=False \
     agent.config.training=False \
     agent.config.use_proj_image=False \
@@ -29,4 +28,5 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
     agent.config.use_unc_score=True \
     agent.config.navi_path=$GOAL_COORD_PATH \
     agent.config.unc_path=$UNC_PATH \
+    agent.config.num_goal_points=3 \
     agent.config.use_wm=False

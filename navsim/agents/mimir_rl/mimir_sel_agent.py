@@ -166,6 +166,13 @@ class MimirSelAgent(AbstractAgent):
             loss_dict.update(sub_loss_dict)
         if reward_dict is not None:
             loss_dict.update(reward_dict)
+            # 部署对齐指标：最终真正输出的那条轨迹（traj_to_score[:,-1]，即最后一个 fine）
+            # 在验证集上的真实 PDM。selector 过拟合后 val 会掉，用它来按 val 选 checkpoint，
+            # 而不是保留最后一个已经过拟合的 epoch。
+            fine_keys = [k for k in reward_dict if k.startswith('fine_reward_')]
+            if fine_keys:
+                last_fine = max(fine_keys, key=lambda k: int(k.rsplit('_', 1)[-1]))
+                loss_dict['select_reward'] = reward_dict[last_fine]
         return loss_dict
 
 
@@ -236,5 +243,17 @@ class MimirSelAgent(AbstractAgent):
 
     def get_training_callbacks(self) -> List[pl.Callback]:
         """Inherited, see superclass."""
-        return [MimirCallback(self._config),
-                pl.callbacks.ModelCheckpoint(every_n_epochs=1, save_top_k=-1, monitor="epoch", mode="max"), ]
+        return [
+            MimirCallback(self._config),
+            # 定期存档：保留每个 epoch，便于回溯 / 手动挑选。
+            pl.callbacks.ModelCheckpoint(every_n_epochs=2, save_top_k=-1, monitor="epoch", mode="max"),
+            # 按验证集"最终选出轨迹"的真实 PDM 选最优：selector 的 val 会在几个 epoch 后过拟合下降，
+            # 用它选 checkpoint，避免部署到已经过拟合的晚期 epoch。
+            pl.callbacks.ModelCheckpoint(
+                monitor="val/select_reward_epoch",
+                mode="max",
+                save_top_k=1,
+                save_last=True,
+                filename="best-{epoch}",
+            ),
+        ]

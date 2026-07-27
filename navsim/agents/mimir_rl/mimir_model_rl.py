@@ -511,13 +511,19 @@ class MimirRlModel(nn.Module):
 
         output: Dict[str, torch.Tensor] = {"bev_semantic_map": bev_semantic_map}
 
-        with torch.no_grad():
-            old_pred = self._trajectory_head(trajectory_query,agents_query,cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=pix,eta=eta, old_pred=None,metric_cache=metric_cache,cal_pdm=cal_pdm,token=token,goalpoint=goalpoint,points_score=points_score)
-        pred = self._trajectory_head(trajectory_query,agents_query,cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=pix,eta=eta,old_pred=old_pred,metric_cache=metric_cache,cal_pdm=cal_pdm,goalpoint=goalpoint,points_score=points_score)
-        if 'reward' not in pred:
-            pred['reward'] = old_pred['reward']
-        if 'sub_rewards' not in pred:
-            pred['sub_rewards'] = old_pred['sub_rewards']
+        # old_pred 只在 training 分支被 get_rlloss 消费；eval 时 forward_test_rl 会忽略它，
+        # 再跑一遍等于把整条 diffusion 采样白算一次，所以只在训练时求。
+        if self.training:
+            with torch.no_grad():
+                old_pred = self._trajectory_head(trajectory_query,agents_query,cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=pix,eta=eta, old_pred=None,metric_cache=metric_cache,cal_pdm=cal_pdm,token=token,goalpoint=goalpoint,points_score=points_score)
+        else:
+            old_pred = None
+        pred = self._trajectory_head(trajectory_query,agents_query,cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=pix,eta=eta,old_pred=old_pred,metric_cache=metric_cache,cal_pdm=cal_pdm,token=token,goalpoint=goalpoint,points_score=points_score)
+        if old_pred is not None:
+            if 'reward' not in pred:
+                pred['reward'] = old_pred['reward']
+            if 'sub_rewards' not in pred:
+                pred['sub_rewards'] = old_pred['sub_rewards']
         output.update(pred)
 
         agents = self._agent_head(agents_query)
@@ -1796,6 +1802,25 @@ class TrajectoryHead(nn.Module):
         diffusion_output = self.denorm_odo(diffusion_output_mean)
 
         diffusion_output = self.bezier_xyyaw(diffusion_output)  # (B, G, 8, 1)
+
+        # ---------- 部署 / 官方评测路径 ----------
+        # 没有 metric_cache 就算不出 PDM reward，targets 也是 None，后面的 loss/reward 全走不通。
+        # 这里直接用 diffusion decoder 自带的 cls head 选一条轨迹输出，和 base agent 的推理方式
+        # 保持一致（mimir_model.py 的 mode_idx = poses_cls.argmax(dim=-1)）。
+        if metric_cache is None:
+            # poses_cls: (B, G//20, 20) -> (B, G)，展平顺序与 poses_reg / diffusion_output 相同
+            candidate_logits = poses_cls.reshape(bs, -1)
+            assert candidate_logits.shape[1] == diffusion_output.shape[1], (
+                f"candidate_logits {tuple(candidate_logits.shape)} 与 "
+                f"diffusion_output {tuple(diffusion_output.shape)} 的候选维度不一致"
+            )
+            best_idx = candidate_logits.argmax(dim=-1)                                  # (B,)
+            best_traj = diffusion_output[torch.arange(bs, device=device), best_idx]      # (B, 8, 3)
+            return {
+                "trajectory": best_traj,
+                "candidate_trajectories": diffusion_output,
+                "candidate_logits": candidate_logits,
+            }
 
         all_diffusion_output = torch.stack(all_diffusion_output, dim=-1) # BG N step_num
         all_log_probs = torch.stack(all_log_probs, dim=-1) # BG N step_num

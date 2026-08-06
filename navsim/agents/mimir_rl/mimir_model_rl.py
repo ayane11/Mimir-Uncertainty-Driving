@@ -520,10 +520,18 @@ class MimirRlModel(nn.Module):
             old_pred = None
         pred = self._trajectory_head(trajectory_query,agents_query,cross_bev_feature,bev_spatial_shape,status_encoding[:, None],targets=targets,global_img=pix,eta=eta,old_pred=old_pred,metric_cache=metric_cache,cal_pdm=cal_pdm,token=token,goalpoint=goalpoint,points_score=points_score)
         if old_pred is not None:
-            if 'reward' not in pred:
-                pred['reward'] = old_pred['reward']
-            if 'sub_rewards' not in pred:
-                pred['sub_rewards'] = old_pred['sub_rewards']
+            for key in (
+                'reward',
+                'sub_rewards',
+                'reward_mean',
+                'reward_max',
+                'reward_std',
+                'reward_gt_mean',
+                'positive_rate',
+                'adv_positive_rate',
+            ):
+                if key not in pred and key in old_pred:
+                    pred[key] = old_pred[key]
         output.update(pred)
 
         agents = self._agent_head(agents_query)
@@ -1686,6 +1694,12 @@ class TrajectoryHead(nn.Module):
                     continue
 
             # for log
+            reward_mean = reward_group.mean(dim=(1, 2, 3)).mean()
+            reward_max = reward_group.amax(dim=(1, 2, 3)).mean()
+            reward_std = reward_group.std(dim=(1, 2, 3)).mean()
+            reward_gt_mean = reward_gt.mean()
+            positive_rate = mask_positive.float().mean()
+
             pos_cnt  = mask_positive.sum(dim=(1,2,3), keepdim=True)                  # (B,1)
             pos_sum  = (reward_group * mask_positive.float()).sum(dim=(1,2,3), keepdim=True)
 
@@ -1718,7 +1732,18 @@ class TrajectoryHead(nn.Module):
             reward = None
             sub_rewards_mean = None
 
-        return {"all_diffusion_output":all_diffusion_output,"advantages":advantages,'reward':reward,'sub_rewards':sub_rewards_mean}
+        return {
+            "all_diffusion_output": all_diffusion_output,
+            "advantages": advantages,
+            "reward": reward,
+            "sub_rewards": sub_rewards_mean,
+            "reward_mean": reward_mean,
+            "reward_max": reward_max,
+            "reward_std": reward_std,
+            "reward_gt_mean": reward_gt_mean,
+            "positive_rate": positive_rate,
+            "adv_positive_rate": (advantages > 0).float().mean(),
+        }
 
 
     def forward_test_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets,global_img,metric_cache,eta=0.0,goalpoint=None,points_score=None) -> Dict[str, torch.Tensor]:
@@ -1828,6 +1853,9 @@ class TrajectoryHead(nn.Module):
 
         reward_group, metric_cache, sub_rewards_group = self.get_pdm_score_para(diffusion_output, metric_cache)
 
+        reward_mean = reward_group.mean(dim=-1).mean()
+        reward_std = reward_group.std(dim=-1).mean()
+
         reward_group = reward_group.max(dim=-1)[0]
 
         target_traj = targets['trajectory'].unsqueeze(1)
@@ -1842,7 +1870,15 @@ class TrajectoryHead(nn.Module):
             k: v.mean().item()    # .item() 把 0-D ndarray 转成 Python float
             for k, v in sub_rewards_group.items()
         }
-        return {"loss": trajectory_loss, "reward": reward_group.mean(),'sub_rewards':sub_scores_mean,"all_diffusion_output":all_diffusion_output,"log_probs":all_log_probs}
+        return {
+            "loss": trajectory_loss,
+            "reward": reward_group.mean(),
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "sub_rewards":sub_scores_mean,
+            "all_diffusion_output":all_diffusion_output,
+            "log_probs":all_log_probs,
+        }
 
     def get_rlloss(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding, targets,global_img, eta, old_pred,goalpoint=None,points_score=None):
 
@@ -1935,21 +1971,35 @@ class TrajectoryHead(nn.Module):
         # ---------- (2) IL 损失，先算每个 batch ----------
         IL_loss_b = torch.zeros_like(RL_loss_b)     # (B,)
         target_traj = targets['trajectory'].unsqueeze(1).repeat(1, per_token_logps.shape[1], 1, 1)
-        
+        negative_trajectory = targets.get('negative_trajectory')
+        negative_valid_mask = None
+        if negative_trajectory is not None:
+            negative_trajectory = negative_trajectory.to(target_traj)
+            negative_valid_mask = negative_trajectory.abs().sum(dim=(-1, -2)) > 0
+            negative_target_traj = negative_trajectory.unsqueeze(1).repeat(1, per_token_logps.shape[1], 1, 1)
         for poses_reg_list in poses_reg_steps_list:                 # 5 个 time-step
             for poses_reg in poses_reg_list:                        # 2 层 decoder
                 traj_l1 = F.l1_loss(poses_reg[...,:2], target_traj[...,:2], reduction='none')  # (B,G,T,C)
-                IL_loss_b += traj_l1.mean()                   # 加到 (B,)
+                il_term = traj_l1.mean()
+                if negative_valid_mask is not None and negative_valid_mask.any():
+                    rde_term = (poses_reg[..., :2] - negative_target_traj[..., :2]).abs().mean(-1).mean(-1)
+                    rde_term = rde_term[negative_valid_mask].mean()
+                    il_term = il_term - self._config.rde_loss_weight * rde_term / self._config.trajectory_reg_weight
+                IL_loss_b += il_term                   # 加到 (B,)
 
         IL_loss_b /= (len(poses_reg_steps_list) * len(poses_reg_steps_list[0]))  # 取平均
         has_positive   = (advantages > 0).any(dim=2).any(dim=1)         # (B,) bool
 
         il_weight  = torch.where(has_positive == 0,          # (B,)
-                                torch.tensor(1.0,  device=RL_loss_b.device),
-                                torch.tensor(0.1, device=RL_loss_b.device))
+                                torch.tensor(0.7,  device=RL_loss_b.device),
+                                torch.tensor(0.07, device=RL_loss_b.device))
         loss_b     = RL_loss_b + il_weight*IL_loss_b  # (B,)
         loss       = loss_b.mean()                        # 标量
-        return {"loss": loss}
+        return {
+            "loss": loss,
+            "rl_loss": RL_loss_b.mean().detach(),
+            "il_loss": IL_loss_b.mean().detach(),
+        }
 
 
     def bezier_xyyaw(self,xy8: torch.Tensor) -> torch.Tensor:

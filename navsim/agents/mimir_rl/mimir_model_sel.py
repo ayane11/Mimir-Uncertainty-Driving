@@ -352,7 +352,6 @@ class MimirSelModel(nn.Module):
             plan_anchor_path=config.plan_anchor_path,
             config=config,
         )
-
         self.bev_proj = nn.Sequential(
             *linear_relu_ln(256, 1, 1,320),
         )
@@ -430,7 +429,6 @@ class MimirSelModel(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(config.tf_d_model // 2, 1),
             )
-
 
     def forward(self, features: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]=None, eta=0.0, metric_cache=None, cal_pdm=True,token=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
@@ -521,25 +519,39 @@ class MimirSelModel(nn.Module):
         output.update(agents)
 
         if self._config.use_wm:
-            self._add_wm_candidate_selection_outputs(output, keyval)
-            self._apply_wm_candidate_selection(output)
+            with torch.no_grad():
+                self._add_wm_candidate_selection_outputs(output, keyval)
+                self._apply_wm_candidate_selection(output)
 
-            if targets is not None:
-                if "wm_future_bev_semantic_map" not in targets:
-                    target_keys = ", ".join(sorted(targets.keys()))
-                    raise RuntimeError(
-                        "use_wm=True requires future BEV semantic map targets, but none were found. "
-                        "Rebuild the cache with the WM future BEV target builder, "
-                        f"and check target keys. Received target keys: {target_keys}"
-                    )
-
-                wm_training_trajectory = output["trajectory"]
-                if wm_training_trajectory.ndim == 4:
-                    wm_training_trajectory = wm_training_trajectory[:, -1]
-                output["wm_future_bev_semantic_map"] = self._rollout_wm_future_bev_semantic_maps(
-                    initial_latent=keyval,
-                    trajectory=wm_training_trajectory.to(keyval),
+            fusion_indices = output["fusion_selected_candidate_indices"]
+            fusion_score_std = output.get("fusion_score_std", {})
+            fusion_std_dict = {
+                "fusion_std_base": fusion_score_std.get("fusion_base_score_std"),
+                "fusion_std_wm": fusion_score_std.get("fusion_wm_score_std"),
+                "fusion_std_coarse": fusion_score_std.get("fusion_coarse_score_std"),
+            }
+            fusion_std_dict = {
+                name: value for name, value in fusion_std_dict.items() if value is not None
+            }
+            if self.training:
+                candidate_reward_group = output["candidate_reward_group"]
+                fusion_reward_dict = {
+                    metric_name: torch.gather(candidate_reward_group, 1, selected_index[:, None]).mean()
+                    for metric_name, selected_index in fusion_indices.items()
+                }
+                output.setdefault("reward_dict", {}).update(fusion_reward_dict)
+                output["reward_dict"].update(fusion_std_dict)
+            elif metric_cache is not None:
+                selected_trajectories = output["fusion_selected_trajectories"]
+                fusion_reward_group, _, _, _ = self._trajectory_head.get_pdm_score_para(
+                    selected_trajectories,
+                    metric_cache,
                 )
+                output["reward_dict"] = {
+                    metric_name: fusion_reward_group[:, index].mean()
+                    for index, metric_name in enumerate(fusion_indices)
+                }
+                output["reward_dict"].update(fusion_std_dict)
 
         return output
 
@@ -674,13 +686,7 @@ class MimirSelModel(nn.Module):
         if anchor_count <= 0:
             return num_candidates
 
-        anchor_trajectories = output.get("anchor_trajectories")
-        if anchor_trajectories is not None:
-            goal_count = anchor_trajectories.shape[1] if anchor_trajectories.ndim == 6 else 1
-        else:
-            goal_count = max(1, num_candidates // anchor_count)
-
-        return min(num_candidates, anchor_count * goal_count)
+        return min(num_candidates, anchor_count * int(self._config.num_goal_points))
 
     def _compute_wm_reward_feature(
         self,
@@ -709,36 +715,73 @@ class MimirSelModel(nn.Module):
         cat_reward_feature = cat_reward_feature.reshape(batch_size, -1)
         return self.reward_cat_head(cat_reward_feature)
 
+    @staticmethod
+    def _fusion_metric_name(coarse_weight: float) -> str:
+        return f"fusion_reward_cw_{coarse_weight:.1f}".replace(".", "_")
+
     def _apply_wm_candidate_selection(self, output: Dict[str, torch.Tensor]) -> None:
         candidate_trajectories = output.get("wm_candidate_trajectories")
         wm_candidate_logits = output.get("wm_candidate_logits")
         base_logits = output.get("wm_candidate_base_logits")
-        if candidate_trajectories is None or wm_candidate_logits is None or base_logits is None:
+        candidate_indices = output.get("wm_candidate_indices")
+        coarse_logits = output.get("candidate_coarse_scores")
+        if (
+            candidate_trajectories is None
+            or wm_candidate_logits is None
+            or base_logits is None
+            or candidate_indices is None
+            or coarse_logits is None
+        ):
             return
 
-        base_weight = float(getattr(self._config, "wm_base_logit_weight", 1.0))
-        wm_weight = float(getattr(self._config, "wm_inference_score_weight", 1.0))
+        coarse_logits = torch.gather(coarse_logits, dim=1, index=candidate_indices)
         base_scores = F.log_softmax(base_logits, dim=1)
         wm_scores = F.log_softmax(wm_candidate_logits, dim=1)
-        final_scores = base_weight * base_scores + wm_weight * wm_scores
-        best_index = final_scores.argmax(dim=1)
-        gather_index = best_index[:, None, None, None].expand(
-            -1,
-            1,
-            candidate_trajectories.shape[2],
-            candidate_trajectories.shape[3],
-        )
-        output["trajectory"] = torch.gather(candidate_trajectories, dim=1, index=gather_index).squeeze(1)
+        coarse_scores = F.log_softmax(coarse_logits, dim=1)
+        base_weight = float(self._config.fusion_base_weight)
+        wm_weight = float(self._config.fusion_wm_weight)
+
+        fusion_indices = {}
+        fusion_trajectories = []
+        default_trajectory = None
+        for coarse_weight in self._config.fusion_coarse_weights:
+            coarse_weight = float(coarse_weight)
+            final_scores = (
+                base_weight * base_scores
+                + wm_weight * wm_scores
+                + coarse_weight * coarse_scores
+            )
+            local_best_index = final_scores.argmax(dim=1)
+            selected_candidate_index = torch.gather(
+                candidate_indices,
+                dim=1,
+                index=local_best_index[:, None],
+            ).squeeze(1)
+            metric_name = self._fusion_metric_name(coarse_weight)
+            fusion_indices[metric_name] = selected_candidate_index
+            gather_index = local_best_index[:, None, None, None].expand(
+                -1,
+                1,
+                candidate_trajectories.shape[2],
+                candidate_trajectories.shape[3],
+            )
+            fusion_trajectories.append(
+                torch.gather(candidate_trajectories, dim=1, index=gather_index)
+            )
+            if abs(coarse_weight - float(self._config.weight)) < 1e-6:
+                default_trajectory = fusion_trajectories[-1]
+
+        output["fusion_selected_candidate_indices"] = fusion_indices
+        output["fusion_selected_trajectories"] = torch.cat(fusion_trajectories, dim=1)
+        output["trajectory"] = default_trajectory.squeeze(1) if default_trajectory is not None else fusion_trajectories[-1].squeeze(1)
         output["wm_candidate_base_scores"] = base_scores
         output["wm_candidate_scores"] = wm_scores
-        output["wm_candidate_final_scores"] = final_scores
-        output["wm_candidate_selected_index"] = best_index
-        if "wm_candidate_indices" in output:
-            output["wm_candidate_selected_candidate_index"] = torch.gather(
-                output["wm_candidate_indices"],
-                dim=1,
-                index=best_index[:, None],
-            ).squeeze(1)
+        output["wm_candidate_coarse_scores"] = coarse_scores
+        output["fusion_score_std"] = {
+            "fusion_base_score_std": base_scores.std(dim=1, unbiased=False).mean(),
+            "fusion_wm_score_std": wm_scores.std(dim=1, unbiased=False).mean(),
+            "fusion_coarse_score_std": coarse_scores.std(dim=1, unbiased=False).mean(),
+        }
 
     def _decode_wm_bev_semantic_map(self, wm_latent: torch.Tensor) -> torch.Tensor:
         """Decode predicted WM latent tokens into a future ego-frame BEV semantic map."""
@@ -1008,6 +1051,7 @@ class DiffMotionPlanningRefinementModule(nn.Module):
         traj_feature,
     ):
         bs, ego_fut_mode, _ = traj_feature.shape
+
         # 6. get final prediction
         traj_feature = traj_feature.view(bs, ego_fut_mode,-1)
         plan_cls = self.plan_cls_branch(traj_feature).squeeze(-1)
@@ -1269,16 +1313,11 @@ class CustomTransformerDecoderLayer(nn.Module):
         traj_feature = self.time_modulation(traj_feature, time_embed,global_cond=None,global_img=None)
         
         # 4.9 predict the offset & heading
-        traj_feature = traj_feature.view(traj_feature.shape[0], -1, 20, traj_feature.shape[-1])
-        bs,num_groups, _, _ = traj_feature.shape
-        traj_feature = traj_feature.view(-1, 20, traj_feature.shape[-1])
         poses_reg, poses_cls = self.task_decoder(traj_feature) #bs,20,8,3; bs,20
-        poses_reg = poses_reg.view(bs, 20*num_groups, 8, 3)
-        poses_cls = poses_cls.view(bs, -1, 20)
         poses_reg[...,:2] = poses_reg[...,:2] + noisy_traj_points
         poses_reg[..., StateSE2Index.HEADING] = poses_reg[..., StateSE2Index.HEADING].tanh() * np.pi
 
-        return poses_reg, poses_cls, traj_feature
+        return poses_reg, poses_cls
 def _get_clones(module, N):
     # FIXME: copy.deepcopy() is not defined on nn.module
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -1313,11 +1352,11 @@ class CustomTransformerDecoder(nn.Module):
         poses_cls_list = []
         traj_points = noisy_traj_points
         for mod in self.layers:
-            poses_reg, poses_cls, traj_feature = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score=points_score)
+            poses_reg, poses_cls = mod(traj_feature, traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,points_score=points_score)
             poses_reg_list.append(poses_reg)
             poses_cls_list.append(poses_cls)
             traj_points = poses_reg[...,:2].clone().detach()
-        return poses_reg_list, poses_cls_list, traj_feature
+        return poses_reg_list, poses_cls_list
 
 class DDIMScheduler_with_logprob(DDIMScheduler):
     def step(
@@ -1496,7 +1535,6 @@ class TrajectoryHead(nn.Module):
 
         self.diffusion_scheduler = DDIMScheduler(
             num_train_timesteps=1000,
-            steps_offset=1,
             beta_schedule="scaled_linear",
             prediction_type="sample",
         )
@@ -1539,7 +1577,7 @@ class TrajectoryHead(nn.Module):
             d_ffn=d_ffn,
             config=config,
         )
-        self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 1)
+        self.diff_decoder = CustomTransformerDecoder(diff_decoder_layer, 2)
         
         # coarse scorer
         scorer_decoder_layer = ScorerTransformerDecoderLayer(
@@ -1566,35 +1604,6 @@ class TrajectoryHead(nn.Module):
             nn.Linear(512, 1),
         )
         self.C_head = nn.Sequential(
-            *linear_relu_ln(512, 1, 2),
-            nn.Linear(512, 1),
-        )
-
-        # fine scorer
-        fine_scorer_decoder_layer = ScorerTransformerDecoderLayer(
-            num_poses=num_poses,
-            d_model=d_model,
-            d_ffn=d_ffn,
-            config=config,
-        )
-        self.fine_scorer_decoder = ScorerTransformerDecoder(fine_scorer_decoder_layer, 3)
-        self.fine_NC_head = nn.Sequential(
-            *linear_relu_ln(512, 1, 2),
-            nn.Linear(512, 1),
-        )
-        self.fine_EP_head = nn.Sequential(
-            *linear_relu_ln(512, 2, 2),
-            nn.Linear(512, 1),
-        )
-        self.fine_DAC_head = nn.Sequential(
-            *linear_relu_ln(512, 1, 2),
-            nn.Linear(512, 1),
-        )
-        self.fine_TTC_head = nn.Sequential(
-            *linear_relu_ln(512, 1, 2),
-            nn.Linear(512, 1),
-        )
-        self.fine_C_head = nn.Sequential(
             *linear_relu_ln(512, 1, 2),
             nn.Linear(512, 1),
         )
@@ -1645,8 +1654,14 @@ class TrajectoryHead(nn.Module):
             points_score = points_score.to(device=device, dtype=dtype)
         return goalpoint, points_score
 
+    def _encode_goal_condition(self, goalpoint, points_score):
+        goal_condition = torch.stack([goalpoint, points_score], dim=2)
+        goal_info_embed = gen_sineembed_for_position(goal_condition, hidden_dim=128)
+        goal_info_embed = goal_info_embed.flatten(-2)
+        return self.goalpoint_encoder(goal_info_embed)
+
     @staticmethod
-    def _expand_by_goal(tensor, goal_count):
+    def _repeat_modes_by_goal(tensor, goal_count):
         if goal_count == 1:
             return tensor
         bs, num_modes = tensor.shape[:2]
@@ -1655,20 +1670,13 @@ class TrajectoryHead(nn.Module):
             goal_count * num_modes,
             *tensor.shape[2:],
         )
-    
-    def _add_goal_condition(self, traj_feature, bs, ego_fut_mode, goalpoint=None, points_score=None):
-        traj_feature = traj_feature.view(bs, ego_fut_mode, -1)
-        if goalpoint is None:
-            return traj_feature
-        if points_score is None:
-            points_score = torch.ones_like(goalpoint)
-        goal_info_embed = gen_sineembed_for_position(
-            torch.stack([goalpoint.squeeze(2), points_score.squeeze(2)], dim=2),
-            hidden_dim=128,
-        )
-        goal_info_embed = goal_info_embed.flatten(-2)
-        goal_info_feature = self.goalpoint_encoder(goal_info_embed)
-        return traj_feature + goal_info_feature.view(bs, ego_fut_mode, -1)
+
+    @staticmethod
+    def _add_goal_feature(traj_feature, goal_feature, modes_per_goal):
+        bs, goal_count, d_model = goal_feature.shape
+        query_goal_feature = goal_feature[:, :, None, :].expand(-1, -1, modes_per_goal, -1)
+        query_goal_feature = query_goal_feature.reshape(bs, goal_count * modes_per_goal, d_model)
+        return traj_feature + query_goal_feature
 
     @staticmethod
     def _build_per_query_goal_inputs(goalpoint, points_score, modes_per_goal):
@@ -1684,20 +1692,19 @@ class TrajectoryHead(nn.Module):
         odo_info_fut_y = odo_info_fut[..., 1:2]
         odo_info_fut_head = odo_info_fut[..., 2:3]
 
-        odo_info_fut_x = odo_info_fut_x/50
-        odo_info_fut_y = odo_info_fut_y/20
-        odo_info_fut_head = odo_info_fut_head/1.57 # not used
+        odo_info_fut_x = 2*(odo_info_fut_x + 1.2)/56.9 -1
+        odo_info_fut_y = 2*(odo_info_fut_y + 20)/46 -1
+        odo_info_fut_head = 2*(odo_info_fut_head + 2)/3.9 -1
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
     def denorm_odo(self, odo_info_fut):
         odo_info_fut_x = odo_info_fut[..., 0:1]
         odo_info_fut_y = odo_info_fut[..., 1:2]
         odo_info_fut_head = odo_info_fut[..., 2:3]
 
-        odo_info_fut_x = odo_info_fut_x * 50
-        odo_info_fut_y = odo_info_fut_y * 20
-        odo_info_fut_head = odo_info_fut_head*1.57 # not used
+        odo_info_fut_x = (odo_info_fut_x + 1)/2 * 56.9 - 1.2
+        odo_info_fut_y = (odo_info_fut_y + 1)/2 * 46 - 20
+        odo_info_fut_head = (odo_info_fut_head + 1)/2 * 3.9 - 2
         return torch.cat([odo_info_fut_x, odo_info_fut_y, odo_info_fut_head], dim=-1)
-
 
     def forward(self, ego_query, agents_query, bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets=None,global_img=None,eta=0.0,metric_cache=None, cal_pdm=True, old_model=False,token=None,goalpoint=None,points_score=None) -> Dict[str, torch.Tensor]:
         """Torch module forward pass."""
@@ -1788,86 +1795,6 @@ class TrajectoryHead(nn.Module):
         # reward_flat     = sub_rewards_group['final'].reshape(bs, num_groups * ego_fut_mode)
         coarse_reward   = sub_rewards_group['final'][torch.arange(bs), best_idx]     # (B,)
         return loss_coarse, final_coarse_reward, coarse_reward, loss_dict
-
-    def _score_fine_multi(
-        self,
-        traj_feature_list: torch.Tensor,                 # (B, Gk, C)   k==num_groups*ego_fut_mode
-        sub_rewards_group: Dict[str, torch.Tensor], # 每个 shape=(B, Gk)
-        only_reward: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        loss_fine = 0.0
-        loss_dict = {}
-        fine_reward_dict = {}
-        fine_reward = 0.0
-        best_idx_list = []
-        bs = traj_feature_list[0].shape[0]
-        if sub_rewards_group is not None:
-            gt_nc = sub_rewards_group["no_collision"]
-            gt_nc[gt_nc == 0.5] = 0.0
-        for i, feat in enumerate(traj_feature_list):
-            EP_score = self.fine_EP_head(feat).squeeze(-1)
-            NC_score = self.fine_NC_head(feat).squeeze(-1)
-            DAC_score = self.fine_DAC_head(feat).squeeze(-1)
-            TTC_score = self.fine_TTC_head(feat).squeeze(-1)
-            C_score = self.fine_C_head(feat).squeeze(-1)
-            if not only_reward:
-                loss_nc = self.loss_bce(NC_score, gt_nc)
-                loss_ep = self.loss_bce(EP_score, sub_rewards_group["progress"])
-                # loss_ep = F.smooth_l1_loss(self.sigmoid(EP_score), sub_rewards_group["progress"])
-                loss_dac = self.loss_bce(DAC_score, sub_rewards_group["drivable_area"])
-                loss_ttc = self.loss_bce(TTC_score, sub_rewards_group["ttc"])
-                loss_c   = self.loss_bce_without_reduce(C_score, sub_rewards_group["comfort"])
-                mask = (sub_rewards_group["comfort"] != -1)
-                loss_c = (loss_c * mask).sum() / (mask.sum() + 1e-6)
-
-                # ---------- ② EP → Margin‑Rank loss ----------
-                gt_ep = sub_rewards_group["progress"]           # (B, Gk)
-
-                B, Gk = EP_score.shape
-                idx_i, idx_j = torch.combinations(               # 生成两两组合索引
-                    torch.arange(Gk, device=EP_score.device), r=2
-                ).unbind(-1)                                     # 形状 (P,)
-
-                pred_i, pred_j = EP_score[:, idx_i], EP_score[:, idx_j]   # (B, P)
-                gt_i  , gt_j   = gt_ep[:, idx_i], gt_ep[:, idx_j]   # (B, P)
-
-                target = torch.sign(gt_i - gt_j)                          # 1 / -1 / 0
-                mask   = target != 0                                      # 排除相等
-
-                if mask.any():
-                    loss_rank = self.rank_loss(
-                        pred_i[mask], pred_j[mask], target[mask]
-                    )
-                else:                                                     # 全部相等时不计入
-                    loss_rank = torch.tensor(0., device=EP_score.device)
-                loss_fine_ = loss_nc + loss_ep + loss_dac + loss_ttc + loss_c + 2*loss_rank
-                loss_dict.update({
-                    f"fine_loss_nc_{i}": loss_nc,
-                    f"fine_loss_ep_{i}": loss_ep,
-                    f"fine_loss_dac_{i}": loss_dac,
-                    f"fine_loss_ttc_{i}": loss_ttc,
-                    f"fine_loss_c_{i}": loss_c,
-                    f"fine_loss_rank_{i}": loss_rank,
-                })
-
-                loss_fine = loss_fine + loss_fine_
-            final_fine_reward = (
-                self.sigmoid(NC_score) * self.sigmoid(DAC_score) *
-                (5 * self.sigmoid(TTC_score) +
-                5 * self.sigmoid(EP_score)  +
-                2 * self.sigmoid(C_score)) / 12
-            )  
-            best_idx        = torch.argmax(final_fine_reward, dim=-1)   # (B,)
-            best_idx_list.append(best_idx)
-            if not only_reward:
-                fine_reward   = sub_rewards_group['final'][torch.arange(bs), best_idx]     # (B,)
-                fine_reward_dict.update({
-                    f"fine_reward_{i}": fine_reward.mean(),
-                })
-
-        loss_fine = loss_fine / len(traj_feature_list)       # 取平均        
-
-        return loss_fine, final_fine_reward, fine_reward, loss_dict, fine_reward_dict, best_idx_list
 
     def _get_scorer_inputs(self,
                             diffusion_output: torch.Tensor,   # (B, G_all, 8, 3)  —— 已 bezier/denorm
@@ -2037,287 +1964,194 @@ class TrajectoryHead(nn.Module):
         with torch.no_grad():
             step_num = 2
             bs = ego_query.shape[0]
+            anchor = 20
+            num_samples = self._config.num_samples
             device = ego_query.device
             goalpoint, points_score = self._prepare_goal_inputs(goalpoint, points_score, bs, device, ego_query.dtype)
             goal_count = goalpoint.shape[1]
-            self.diffusionrl_scheduler.set_timesteps(1000, device)
+            goal_info_feature = self._encode_goal_condition(goalpoint, points_score)
+            self.diffusion_scheduler.set_timesteps(1000, device)
             step_ratio = 20 / step_num
             roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
             roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
 
-            num_groups = 2
-            # 1. add truncated noise to the plan anchor
-            plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs,num_groups,1,1,1)
-            plan_anchor = plan_anchor.view(bs, num_groups * self.ego_fut_mode, *plan_anchor.shape[3:]) # bs num_groups * 20, 8, 2
+            plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
+            plan_anchor = plan_anchor.unsqueeze(2).repeat(1,1,num_samples,1,1)
+            plan_anchor = plan_anchor.view(bs,num_samples*anchor, 8, 2)
             modes_per_goal = plan_anchor.shape[1]
-            plan_anchor = self._expand_by_goal(plan_anchor, goal_count)
-            query_goalpoint, query_points_score = self._build_per_query_goal_inputs(goalpoint, points_score, modes_per_goal)
+            plan_anchor = self._repeat_modes_by_goal(plan_anchor, goal_count)
+            query_goalpoint, query_points_score = self._build_per_query_goal_inputs(
+                goalpoint,
+                points_score,
+                modes_per_goal,
+            )
             decoder_points_score = query_points_score if self._config.use_unc_score else 1.0
-
-            diffusion_output = self.norm_odo(plan_anchor)
-            noise = torch.randn(diffusion_output.shape, device=device)
+            img = self.norm_odo(plan_anchor)
+            noise = torch.randn(img.shape, device=device)
             trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
-            diffusion_output = self.diffusion_scheduler.add_noise(original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps)
-            all_diffusion_output = [diffusion_output]
-            all_log_probs = []
-            ego_fut_mode = diffusion_output.shape[1]
-            for i, k in enumerate(roll_timesteps[:]):
-                # diffusion_output_xy = diffusion_output[..., :2]  # 只保留 x, y
-                x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
+            img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
+            ego_fut_mode = img.shape[1]
+            for k in roll_timesteps[:]:
+                x_boxes = torch.clamp(img, min=-1, max=1)
                 noisy_traj_points = self.denorm_odo(x_boxes)
 
-                # 2. proj noisy_traj_points to the query
                 traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
                 traj_pos_embed = traj_pos_embed.flatten(-2)
                 traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-                traj_feature = self._add_goal_condition(
-                    traj_feature,
-                    bs,
-                    ego_fut_mode,
-                    goalpoint=query_goalpoint,
-                    points_score=query_points_score,
+                traj_feature = self._add_goal_feature(
+                    traj_feature.view(bs,ego_fut_mode,-1),
+                    goal_info_feature,
+                    modes_per_goal,
                 )
 
                 timesteps = k
                 if not torch.is_tensor(timesteps):
-                    # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                    timesteps = torch.tensor([timesteps], dtype=torch.long, device=diffusion_output.device)
+                    timesteps = torch.tensor([timesteps], dtype=torch.long, device=img.device)
                 elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-                    timesteps = timesteps[None].to(diffusion_output.device)
-                
-                # 3. embed the timesteps
-                timesteps = timesteps.expand(diffusion_output.shape[0])
+                    timesteps = timesteps[None].to(img.device)
+
+                timesteps = timesteps.expand(img.shape[0])
                 time_embed = self.time_mlp(timesteps)
                 time_embed = time_embed.view(bs,1,-1)
 
-                # 4. begin the stacked decoder
-                poses_reg_list, poses_cls_list,_ = self.diff_decoder(
-                    traj_feature,
-                    noisy_traj_points,
-                    bev_feature,
-                    bev_spatial_shape,
-                    agents_query,
-                    ego_query,
-                    time_embed,
-                    status_encoding,
-                    global_img,
-                    query_goalpoint,
-                    points_score=decoder_points_score,
-                )
+                navi_points=query_goalpoint
+                poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score)
                 poses_reg = poses_reg_list[-1]
                 poses_cls = poses_cls_list[-1]
                 x_start = poses_reg[...,:2]
-                # x_start = poses_reg
                 x_start = self.norm_odo(x_start)
-                diffusion_output,log_prob,diffusion_output_mean = self.diffusionrl_scheduler.step(
+                img = self.diffusion_scheduler.step(
                     model_output=x_start,
                     timestep=k,
-                    sample=diffusion_output,
-                    eta=0.0,
+                    sample=img
+                ).prev_sample
+
+            candidate_trajectories = poses_reg
+            reward_group, metric_cache, sub_rewards_group, _ = self.get_pdm_score_para(candidate_trajectories, metric_cache)
+            oracle_reward = reward_group.max(dim=1).values.mean()
+            keys = sub_rewards_group[0].keys()
+            sub_rewards_group = {
+                key: torch.tensor(
+                    np.vstack([sub_rewards[key] for sub_rewards in sub_rewards_group]),
+                    device=candidate_trajectories.device,
+                    dtype=candidate_trajectories.dtype,
                 )
-            diffusion_output = self.add_mul_noise(diffusion_output,n_aug=2,std_min=0.1,std_max=0.2)
-            diffusion_output = self.denorm_odo(diffusion_output)
-            diffusion_output = self.bezier_xyyaw(diffusion_output) # B G*N 8 3
+                for key in keys
+            }
 
-
-            reward_group, metric_cache, sub_rewards_group, sim_traj  = self.get_pdm_score_para(diffusion_output, metric_cache)      # (B,G)
-            sub_rewards_group, keep_idx = self.get_vocab_pdm_subscores(sub_rewards_group, reward_group, bs, token, dropout_ratio=0.99)
-
-            vocab = self.vocab[:,::5]
-            vocab = vocab.unsqueeze(0).repeat(bs, 1, 1, 1)  # (B,N,8,3)
-            vocab = vocab.gather(1, keep_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 8, 3))           # (B, keep_num, 8, 3)
-            diffusion_output = torch.cat((diffusion_output, vocab), dim=1)  # (B,G_all,8,3)
-
-
-        # scorer
-        # extract feature
-        noisy_traj_points_xy, traj_feature, time_embed = self._get_scorer_inputs(diffusion_output, bs, diffusion_output.shape[1])
-
-        # coarse scorer
-        traj_feature_list = self.scorer_decoder(traj_feature, noisy_traj_points_xy, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)        
+        noisy_traj_points_xy, traj_feature, time_embed = self._get_scorer_inputs(
+            candidate_trajectories,
+            bs,
+            candidate_trajectories.shape[1],
+        )
+        traj_feature_list = self.scorer_decoder(traj_feature, noisy_traj_points_xy, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
         traj_feature = traj_feature_list[-1]
         loss_coarse, final_coarse_reward, coarse_reward, sub_loss_dict = self._score_coarse(
             traj_feature, sub_rewards_group,
         )
 
-        # fine scorer
-        topk = 32
-        traj_feature,noisy_traj_points_xy,sub_rewards_topk,topk_idx,topk_val = self._select_topk(
-                                                                                    final_coarse_reward=final_coarse_reward,
-                                                                                    topk=topk,
-                                                                                    traj_feature=traj_feature,
-                                                                                    noisy_traj_points_xy=noisy_traj_points_xy,
-                                                                                    sub_rewards_group=sub_rewards_group)
-        fine_traj_feature_list = self.fine_scorer_decoder(traj_feature, noisy_traj_points_xy, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)                
-        loss_fine, final_fine_reward, fine_reward, fine_sub_loss_dict, fine_reward_dict, fine_best_idx_list = self._score_fine_multi(
-                fine_traj_feature_list, sub_rewards_topk,
-        )
-        sub_loss_dict.update(fine_sub_loss_dict)
-        reward_dict = fine_reward_dict
-        reward_dict['coarse_reward'] = coarse_reward.mean()
-        loss = loss_fine + loss_coarse
-        return {"loss":loss,"sub_loss_dict": sub_loss_dict, "reward_dict": reward_dict} 
+        reward_dict = {
+            'coarse_reward': coarse_reward.mean(),
+            'oracle_reward': oracle_reward,
+        }
+        return {
+            "loss": loss_coarse,
+            "sub_loss_dict": sub_loss_dict,
+            "reward_dict": reward_dict,
+            "candidate_trajectories": candidate_trajectories,
+            "candidate_logits": poses_cls,
+            "candidate_coarse_scores": final_coarse_reward,
+            "candidate_reward_group": reward_group,
+        }
 
 
     def forward_test_rl(self, ego_query,agents_query,bev_feature,bev_spatial_shape,status_encoding,status_feature,camera_feature, targets,global_img,metric_cache,eta=1.0,token=None,goalpoint=None,points_score=None) -> Dict[str, torch.Tensor]:
         step_num = 2
         bs = ego_query.shape[0]
+        anchor = 20
+        num_samples = self._config.num_samples
         device = ego_query.device
         goalpoint, points_score = self._prepare_goal_inputs(goalpoint, points_score, bs, device, ego_query.dtype)
         goal_count = goalpoint.shape[1]
-        self.diffusionrl_scheduler.set_timesteps(1000, device)
+        goal_info_feature = self._encode_goal_condition(goalpoint, points_score)
+        self.diffusion_scheduler.set_timesteps(1000, device)
         step_ratio = 20 / step_num
         roll_timesteps = (np.arange(0, step_num) * step_ratio).round()[::-1].copy().astype(np.int64)
         roll_timesteps = torch.from_numpy(roll_timesteps).to(device)
 
-        num_groups = 10
-        # 1. add truncated noise to the plan anchor
-        plan_anchor = self.plan_anchor.unsqueeze(0).unsqueeze(0).repeat(bs,num_groups,1,1,1)
-        plan_anchor = plan_anchor.view(bs, num_groups * self.ego_fut_mode, *plan_anchor.shape[3:]) # bs num_groups * 20, 8, 2
+        plan_anchor = self.plan_anchor.unsqueeze(0).repeat(bs,1,1,1)
+        plan_anchor = plan_anchor.unsqueeze(2).repeat(1,1,num_samples,1,1)
+        plan_anchor = plan_anchor.view(bs,num_samples*anchor, 8, 2)
         modes_per_goal = plan_anchor.shape[1]
-        plan_anchor = self._expand_by_goal(plan_anchor, goal_count)
-        query_goalpoint, query_points_score = self._build_per_query_goal_inputs(goalpoint, points_score, modes_per_goal)
+        plan_anchor = self._repeat_modes_by_goal(plan_anchor, goal_count)
+        query_goalpoint, query_points_score = self._build_per_query_goal_inputs(
+            goalpoint,
+            points_score,
+            modes_per_goal,
+        )
         decoder_points_score = query_points_score if self._config.use_unc_score else 1.0
-
-        diffusion_output = self.norm_odo(plan_anchor)
-        noise = torch.randn(diffusion_output.shape, device=device)
+        img = self.norm_odo(plan_anchor)
+        noise = torch.randn(img.shape, device=device)
         trunc_timesteps = torch.ones((bs,), device=device, dtype=torch.long) * 8
-        diffusion_output = self.diffusion_scheduler.add_noise(original_samples=diffusion_output, noise=noise, timesteps=trunc_timesteps)
-        ego_fut_mode = diffusion_output.shape[1]
-        for i, k in enumerate(roll_timesteps[:]):
-            x_boxes = torch.clamp(diffusion_output, min=-1, max=1)
+        img = self.diffusion_scheduler.add_noise(original_samples=img, noise=noise, timesteps=trunc_timesteps)
+        ego_fut_mode = img.shape[1]
+        for k in roll_timesteps[:]:
+            x_boxes = torch.clamp(img, min=-1, max=1)
             noisy_traj_points = self.denorm_odo(x_boxes)
 
-            # 2. proj noisy_traj_points to the query
             traj_pos_embed = gen_sineembed_for_position(noisy_traj_points,hidden_dim=64)
             traj_pos_embed = traj_pos_embed.flatten(-2)
             traj_feature = self.plan_anchor_encoder(traj_pos_embed)
-            traj_feature = self._add_goal_condition(
-                traj_feature,
-                bs,
-                ego_fut_mode,
-                goalpoint=query_goalpoint,
-                points_score=query_points_score,
+            traj_feature = self._add_goal_feature(
+                traj_feature.view(bs,ego_fut_mode,-1),
+                goal_info_feature,
+                modes_per_goal,
             )
 
             timesteps = k
             if not torch.is_tensor(timesteps):
-                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-                timesteps = torch.tensor([timesteps], dtype=torch.long, device=diffusion_output.device)
+                timesteps = torch.tensor([timesteps], dtype=torch.long, device=img.device)
             elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-                timesteps = timesteps[None].to(diffusion_output.device)
-            
-            # 3. embed the timesteps
-            timesteps = timesteps.expand(diffusion_output.shape[0])
+                timesteps = timesteps[None].to(img.device)
+
+            timesteps = timesteps.expand(img.shape[0])
             time_embed = self.time_mlp(timesteps)
             time_embed = time_embed.view(bs,1,-1)
 
-            # 4. begin the stacked decoder
-            poses_reg_list, poses_cls_list,_ = self.diff_decoder(
-                traj_feature,
-                noisy_traj_points,
-                bev_feature,
-                bev_spatial_shape,
-                agents_query,
-                ego_query,
-                time_embed,
-                status_encoding,
-                global_img,
-                query_goalpoint,
-                points_score=decoder_points_score,
-            )
+            navi_points = query_goalpoint
+            poses_reg_list, poses_cls_list = self.diff_decoder(traj_feature, noisy_traj_points, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img,navi_points,decoder_points_score)
             poses_reg = poses_reg_list[-1]
             poses_cls = poses_cls_list[-1]
             x_start = poses_reg[...,:2]
             x_start = self.norm_odo(x_start)
-            diffusion_output,_,_ = self.diffusionrl_scheduler.step(
+            img = self.diffusion_scheduler.step(
                 model_output=x_start,
                 timestep=k,
-                sample=diffusion_output,
-                eta=0.0,
-            )
+                sample=img
+            ).prev_sample
 
-        diffusion_output = self.add_mul_noise(diffusion_output)
-        diffusion_output = self.denorm_odo(diffusion_output)
-        diffusion_output = self.bezier_xyyaw(diffusion_output) # B G*N 8 3
+        candidate_trajectories = poses_reg
 
+        noisy_traj_points_xy, traj_feature, time_embed = self._get_scorer_inputs(
+            candidate_trajectories,
+            bs,
+            candidate_trajectories.shape[1],
+        )
 
-        # scorer
-        # extract feature
-        noisy_traj_points_xy, traj_feature, time_embed = self._get_scorer_inputs(diffusion_output, bs, diffusion_output.shape[1])
-
-        # coarse scorer
-        traj_feature_list = self.scorer_decoder(traj_feature, noisy_traj_points_xy, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)        
+        traj_feature_list = self.scorer_decoder(traj_feature, noisy_traj_points_xy, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
         traj_feature = traj_feature_list[-1]
-        NC_score = self.NC_head(traj_feature).squeeze(-1)             # (B,G)
-        EP_score = self.EP_head(traj_feature).squeeze(-1)             # (B,G)
-        DAC_score = self.DAC_head(traj_feature).squeeze(-1)             # (B,G)
-        TTC_score = self.TTC_head(traj_feature).squeeze(-1)             # (B,G)
-        C_score = self.C_head(traj_feature).squeeze(-1)             # (B,G)
+        NC_score = self.NC_head(traj_feature).squeeze(-1)
+        EP_score = self.EP_head(traj_feature).squeeze(-1)
+        DAC_score = self.DAC_head(traj_feature).squeeze(-1)
+        TTC_score = self.TTC_head(traj_feature).squeeze(-1)
+        C_score = self.C_head(traj_feature).squeeze(-1)
         final_coarse_reward = self.sigmoid(NC_score)*self.sigmoid(DAC_score)*(5*self.sigmoid(TTC_score)+5*self.sigmoid(EP_score)+2*self.sigmoid(C_score))/12
 
-        best_coarse_flat = torch.argmax(final_coarse_reward, dim=-1)      # (B,)
-        coarse_traj = diffusion_output[
-            torch.arange(bs, device=device), best_coarse_flat
-        ].unsqueeze(1) 
-        traj_to_score = [coarse_traj]
-
-        topk = 32
-        traj_feature,noisy_traj_points_xy,sub_rewards_topk,topk_idx,topk_val = self._select_topk(
-                                                                                    final_coarse_reward=final_coarse_reward,
-                                                                                    topk=topk,
-                                                                                    traj_feature=traj_feature,
-                                                                                    noisy_traj_points_xy=noisy_traj_points_xy,
-                                                                                    sub_rewards_group=None)
-
-        fine_traj_feature_list = self.fine_scorer_decoder(traj_feature, noisy_traj_points_xy, bev_feature, bev_spatial_shape, agents_query, ego_query, time_embed, status_encoding,global_img)
-        loss_fine, final_fine_reward, fine_reward, fine_sub_loss_dict, fine_reward_dict, fine_best_idx_list = self._score_fine_multi(
-                fine_traj_feature_list, sub_rewards_topk,only_reward=True,
-        )
-        for best_idx_local in fine_best_idx_list:
-            global_best_idx = topk_idx[torch.arange(bs, device=device), best_idx_local]
-            fine_traj = diffusion_output[
-                torch.arange(bs, device=device), global_best_idx
-            ].unsqueeze(1)  # (B, 1, 8, 3)
-            traj_to_score.append(fine_traj)
-            
-        traj_to_score = torch.cat(traj_to_score, dim=1)
-
-        # for official eval
-        if metric_cache is None:
-            return {"trajectory": traj_to_score[:,-1]}
-
-        reward_group, metric_cache, sub_rewards_group, _ = self.get_pdm_score_para(traj_to_score, metric_cache)
-        reward_dict = {}
-        reward_dict['coarse_reward'] = reward_group[:, 0].mean()
-        for i in range(len(fine_best_idx_list)):
-            reward_dict[f'fine_reward_{i}'] = reward_group[:, i+1].mean()
-
-
-        bs = traj_to_score.shape[0]
-        num_traj_types = traj_to_score.shape[1]
-
-        keys = sub_rewards_group[0].keys()
-        
-        aggregated_sub_rewards = {
-            k: np.vstack([d[k] for d in sub_rewards_group])  # 形状 (B * 4, 1)
-            for k in keys
+        return {
+            "candidate_trajectories": candidate_trajectories,
+            "candidate_logits": poses_cls,
+            "candidate_coarse_scores": final_coarse_reward,
         }
-        
-        for k, v in aggregated_sub_rewards.items():
-            v_tensor = torch.from_numpy(v).squeeze(-1).to(device)
-            
-            try:
-                v_reshaped = v_tensor.reshape(bs, num_traj_types)
-            except RuntimeError as e:
-                print(f"Error reshaping sub_reward '{k}'. Expected {bs * num_traj_types} elements, but got {v_tensor.numel()}.")
-                reward_dict[k] = v_tensor.mean()
-                continue
-            reward_dict[f'coarse_{k}'] = v_reshaped[:, 0].mean()
-            for i in range(3):
-                reward_dict[f'fine_{i}_{k}'] = v_reshaped[:, i+1].mean()
-
-        return {'reward_dict': reward_dict} 
 
     def compute_diversity(self, trajectories, eps=1e-6):
         """

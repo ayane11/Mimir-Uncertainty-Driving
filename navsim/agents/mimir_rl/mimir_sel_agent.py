@@ -68,21 +68,33 @@ class MimirSelAgent(AbstractAgent):
             '_trajectory_head.EP_head',
             '_trajectory_head.C_head',
             '_trajectory_head.TTC_head',
-            '_trajectory_head.fine_scorer_decoder',
-            '_trajectory_head.fine_NC_head',
-            '_trajectory_head.fine_DAC_head',
-            '_trajectory_head.fine_EP_head',
-            '_trajectory_head.fine_C_head',
-            '_trajectory_head.fine_TTC_head',
         ]
+        self._trainable_prefixes = trainable_prefixes
         for name, param in self._mimir_model.named_parameters():
             param.requires_grad = any(name.startswith(p) for p in trainable_prefixes)
-        self._mimir_model.eval()
-        for p in trainable_prefixes:
-            m = dict(self._mimir_model.named_modules()).get(p, None)
-            if m is not None:
-                m.train()
+        self._apply_module_freeze()
         self.init_from_pretrained()
+
+    def _apply_module_freeze(self) -> None:
+        """Keep the model frozen except for the trainable scorer modules."""
+        self._mimir_model.eval()
+        named_modules = dict(self._mimir_model.named_modules())
+        for prefix in self._trainable_prefixes:
+            module = named_modules.get(prefix)
+            if module is not None:
+                module.train()
+
+    def train(self, mode: bool = True):
+        """Set training mode while preserving the frozen-module split.
+
+        Lightning recursively calls ``train()`` on the agent every epoch.  The
+        recursive call would otherwise re-enable frozen BatchNorm buffers and
+        Dropout modules after the initialization-time ``eval()`` calls.
+        """
+        super().train(mode)
+        if mode:
+            self._apply_module_freeze()
+        return self
 
     def init_from_pretrained(self):
         if self._checkpoint_path:
@@ -166,13 +178,12 @@ class MimirSelAgent(AbstractAgent):
             loss_dict.update(sub_loss_dict)
         if reward_dict is not None:
             loss_dict.update(reward_dict)
-            # 部署对齐指标：最终真正输出的那条轨迹（traj_to_score[:,-1]，即最后一个 fine）
-            # 在验证集上的真实 PDM。selector 过拟合后 val 会掉，用它来按 val 选 checkpoint，
-            # 而不是保留最后一个已经过拟合的 epoch。
-            fine_keys = [k for k in reward_dict if k.startswith('fine_reward_')]
-            if fine_keys:
-                last_fine = max(fine_keys, key=lambda k: int(k.rsplit('_', 1)[-1]))
-                loss_dict['select_reward'] = reward_dict[last_fine]
+            selected_metric = self._mimir_model._fusion_metric_name(float(self._config.weight))
+            if selected_metric in reward_dict:
+                loss_dict['select_reward'] = reward_dict[selected_metric]
+            for metric_name, value in reward_dict.items():
+                if metric_name.startswith('fusion_std_'):
+                    loss_dict[metric_name] = value
         return loss_dict
 
 

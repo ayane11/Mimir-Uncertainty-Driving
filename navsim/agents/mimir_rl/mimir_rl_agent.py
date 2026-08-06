@@ -62,11 +62,27 @@ class MimirRlAgent(AbstractAgent):
         for name, param in self._mimir_model.named_parameters():
             if not name.startswith("_trajectory_head"):
                 param.requires_grad = False
+        self._apply_module_freeze()
+        self.init_from_pretrained()
+
+    def _apply_module_freeze(self) -> None:
+        """Keep frozen modules in eval mode while the trajectory head trains."""
         for name, module in self._mimir_model.named_modules():
             if name and not name.startswith("_trajectory_head"):
                 module.eval()
         self._mimir_model._trajectory_head.train()
-        self.init_from_pretrained()
+
+    def train(self, mode: bool = True):
+        """Set training mode while preserving the frozen-module split.
+
+        Lightning recursively calls ``train()`` on the agent every epoch.  The
+        recursive call would otherwise re-enable frozen BatchNorm buffers and
+        Dropout modules after the initialization-time ``eval()`` calls.
+        """
+        super().train(mode)
+        if mode:
+            self._apply_module_freeze()
+        return self
 
     def init_from_pretrained(self):
         if self._checkpoint_path:
@@ -141,6 +157,19 @@ class MimirRlAgent(AbstractAgent):
         reward = predictions['reward']
         sub_rewards = predictions.get('sub_rewards', None)
         loss_dict = {'loss': loss, 'reward':reward}
+        for key in (
+            'reward_mean',
+            'reward_max',
+            'reward_std',
+            'reward_gt_mean',
+            'positive_rate',
+            'adv_positive_rate',
+            'rl_loss',
+            'il_loss',
+        ):
+            value = predictions.get(key)
+            if value is not None:
+                loss_dict[key] = value
         if sub_rewards is not None:
             loss_dict.update(sub_rewards) # add sub rewards to loss_dict if available
         return loss_dict

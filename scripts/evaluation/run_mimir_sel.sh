@@ -8,9 +8,9 @@ export OPENBLAS_CORETYPE=Haswell
 
 # ====================================== use unc to train ==============================================================
 METRIC_CACHE_PATH='/home/navsim/exp/metric_cache'
-CHECKPOINT_PATH='/home/navsim/exp/a_train_mimir_agent_sel/2026.07.19.11.55.08/lightning_logs/version_0/checkpoints/epoch\=4-step\=6650.ckpt'
-GOAL_COORD_PATH='/home/navsim/dataset/naviunc/navtest_naviunc/navi_dict.npy'
-UNC_PATH='/home/navsim/dataset/naviunc/navtest_naviunc/unc_dict.npy'
+CHECKPOINT_PATH='/home/navsim/exp/a_train_mimir_agent_sel/2026.08.05.15.19.59/lightning_logs/version_0/checkpoints/best-epoch\=1.ckpt'
+GOAL_COORD_PATH='/home/navsim/dataset/naviunc/a_navtest_3_05_merge/navi_dict.npy'
+UNC_PATH='/home/navsim/dataset/naviunc/a_navtest_3_05_merge/unc_dict.npy'
 TRAJ_SAVE_PATH='/home/navsim/dataset/trajs'
 
 python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
@@ -29,4 +29,9 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_pdm_score.py \
     agent.config.use_unc_score=True \
     agent.config.navi_path=$GOAL_COORD_PATH \
     agent.config.unc_path=$UNC_PATH \
-    agent.config.use_wm=False
+    agent.config.use_wm=True \
+    agent.config.fusion_base_weight=1.0 \
+    agent.config.fusion_wm_weight=0.5 \
+    agent.config.weight=1.0 \
+    agent.config.num_samples=64 \
+    agent.config.num_goal_points=3

@@ -18,6 +18,7 @@ COORD_PATH='/home/navsim/dataset/naviunc/a_navtrain_3_05_merge/navi_dict.npy'
 UNC_PATH='/home/navsim/dataset/naviunc/a_navtrain_3_05_merge/unc_dict.npy'
 COORD_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/navi_dict.npy'
 UNC_PATH='/home/navsim/dataset/naviunc/navtrain_full_naviunc/unc_dict.npy'
+NEGATIVE_SAMPLES_PATH='/home/navsim/dataset/sample_step5_cfg0.5_noise0.4_proposal64/2026.01.07.03.26.47/negative_sample_results/'
 
 # RL reward requires PDM metric caches under:
 # $TRAIN_METRIC_CACHE_PATH/<log>/$TRAIN_METRIC_CACHE_SCENARIO_TYPE/<token>/metric_cache.pkl
@@ -28,6 +29,7 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     split=trainval \
     use_cache_without_dataset=True \
     cache_path=$CACHE_PATH \
+    negative_samples_path=$NEGATIVE_SAMPLES_PATH \
     +train_metric_cache_path=$TRAIN_METRIC_CACHE_PATH \
     dataloader.params.batch_size=64 \
     trainer.params.accumulate_grad_batches=8 \
@@ -42,7 +44,8 @@ python $NAVSIM_DEVKIT_ROOT/navsim/planning/script/run_training.py \
     agent.config.status_norm=False \
     agent.config.use_unc_score=True \
     agent.config.use_wm=False \
+    agent.config.use_beyonddrive=True \
     agent.config.unc_path=$UNC_PATH \
     agent.config.navi_path=$COORD_PATH \
     agent.config.num_goal_points=1 \
-    agent.lr=2e-4
+    agent.lr=1.5e-4

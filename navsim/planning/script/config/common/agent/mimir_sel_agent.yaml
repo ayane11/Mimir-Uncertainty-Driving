@@ -22,6 +22,11 @@ config:
   wm_reward_num_future_frames: 1
   num_goal_points: 1
   num_groups: 8
+  num_samples: 8
+  fusion_base_weight: 1.0
+  fusion_wm_weight: 0.5
+  weight: 0.2
+  fusion_coarse_weights: [0.0, 0.2, 0.5, 0.8, 1.0]
 
   navi_path: ''
   unc_path: ''

@@ -12,13 +12,15 @@ config:
     interval_length: 0.5
 
   latent: False
+  use_wm: True
+  wm_num_future_frames: 3
+  use_beyonddrive: True
   training: False
   use_proj_image: False
   use_gt_goal_train: True
   status_norm: False
   use_unc_score: False
-  use_wm: True
-  wm_num_future_frames: 3
+
   wm_reward_num_future_frames: 1
   num_goal_points: 1
   num_groups: 4
